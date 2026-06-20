@@ -99,6 +99,81 @@ static void render_context_done(RenderContext *state)
     text_info_done(&state->text_info);
 }
 
+#if CONFIG_THREADS
+static void destroy_render_pool(ASS_Renderer *priv)
+{
+    if (priv->pool) {
+        ass_thread_pool_destroy(priv->pool);
+        priv->pool = NULL;
+    }
+    if (priv->worker_ctx) {
+        for (int i = 0; i < priv->n_threads; i++) {
+            if (priv->worker_ctx[i]) {
+                render_context_done(priv->worker_ctx[i]);
+                free(priv->worker_ctx[i]);
+            }
+        }
+        free(priv->worker_ctx);
+        priv->worker_ctx = NULL;
+    }
+    priv->n_threads = 0;
+}
+
+// Resolve the requested thread count and (re)build the worker pool and the
+// per-worker render contexts. On any allocation failure, falls back to serial
+// rendering (pool == NULL, using priv->state). Must run between frames.
+void ass_renderer_update_pool(ASS_Renderer *priv)
+{
+    int req = priv->settings.render_thread_count;
+    int n;
+    if (req == 1) {
+        n = 1;
+    } else if (req <= 0) {
+        // Auto: most frames have only a few simultaneous events, so extra
+        // workers just idle while costing a RenderContext each. Cap the
+        // auto count to keep memory bounded on many-core machines; an
+        // explicit request > 1 is honored verbatim.
+        n = (int) ass_get_cpu_count();
+        if (n > ASS_AUTO_THREAD_CAP)
+            n = ASS_AUTO_THREAD_CAP;
+    } else {
+        n = req;
+    }
+    if (n < 1)
+        n = 1;
+
+    // Already in the desired configuration?
+    if (n <= 1 ? !priv->pool : (priv->pool && priv->n_threads == n))
+        return;
+
+    destroy_render_pool(priv);
+    if (n <= 1)
+        return;  // serial path uses priv->state
+
+    priv->worker_ctx = calloc(n, sizeof(*priv->worker_ctx));
+    if (!priv->worker_ctx)
+        return;
+    int built = 0;
+    for (; built < n; built++) {
+        RenderContext *ctx = calloc(1, sizeof(*ctx));
+        if (!ctx || !render_context_init(ctx, priv)) {
+            free(ctx);
+            break;
+        }
+        priv->worker_ctx[built] = ctx;
+    }
+    priv->n_threads = built;
+    if (built < n) {
+        destroy_render_pool(priv);  // partial: drop everything, stay serial
+        return;
+    }
+
+    priv->pool = ass_thread_pool_create(n);
+    if (!priv->pool)
+        destroy_render_pool(priv);  // frees the n contexts, stays serial
+}
+#endif
+
 ASS_Renderer *ass_renderer_init(ASS_Library *library)
 {
     int error;
@@ -128,6 +203,15 @@ ASS_Renderer *ass_renderer_init(ASS_Library *library)
     priv->library = library;
     priv->ftlibrary = ft;
     // images_root and related stuff is zero-filled in calloc
+
+    if (ass_rmutex_init(&priv->font_lock) != 0) {
+        FT_Done_FreeType(ft);
+        free(priv);
+        priv = 0;
+        goto fail;
+    }
+
+    priv->settings.render_thread_count = 1;  // serial by default
 
     unsigned flags = ASS_CPU_FLAG_ALL;
 #if CONFIG_LARGE_TILES
@@ -180,6 +264,12 @@ void ass_renderer_done(ASS_Renderer *render_priv)
     ass_frame_unref(render_priv->images_root);
     ass_frame_unref(render_priv->prev_images_root);
 
+#if CONFIG_THREADS
+    // Tear down workers (and their render contexts) before the caches their
+    // shapers reference are destroyed.
+    destroy_render_pool(render_priv);
+#endif
+
     ass_cache_done(render_priv->cache.composite_cache);
     ass_cache_done(render_priv->cache.bitmap_cache);
     ass_cache_done(render_priv->cache.outline_cache);
@@ -194,6 +284,8 @@ void ass_renderer_done(ASS_Renderer *render_priv)
     free(render_priv->eimg);
 
     render_context_done(&render_priv->state);
+
+    ass_rmutex_destroy(&render_priv->font_lock);
 
     free(render_priv->settings.default_font);
     free(render_priv->settings.default_family);
@@ -1242,16 +1334,22 @@ size_t ass_outline_construct(void *key, void *value, void *priv)
     case OUTLINE_GLYPH:
         {
             GlyphHashKey *k = &outline_key->u.glyph;
+            ass_rmutex_lock(k->font->lock);
             ass_face_set_size(k->font->faces[k->face_index], k->size);
             if (!ass_font_get_glyph(k->font, k->face_index, k->glyph_index,
-                                    render_priv->settings.hinting))
+                                    render_priv->settings.hinting)) {
+                ass_rmutex_unlock(k->font->lock);
                 return 1;
+            }
             if (!ass_get_glyph_outline(&v->outline[0], &v->advance,
                                        k->font->faces[k->face_index],
-                                       k->flags))
+                                       k->flags)) {
+                ass_rmutex_unlock(k->font->lock);
                 return 1;
+            }
             ass_font_get_asc_desc(k->font, k->face_index,
                                   &v->asc, &v->desc);
+            ass_rmutex_unlock(k->font->lock);
             break;
         }
     case OUTLINE_DRAWING:
@@ -3072,6 +3170,12 @@ ass_start_frame(ASS_Renderer *render_priv, ASS_Track *track,
     }
 
     setup_shaper(render_priv->state.shaper, render_priv);
+#if CONFIG_THREADS
+    // Worker contexts have their own shapers; configure them identically.
+    if (render_priv->pool)
+        for (int i = 0; i < render_priv->n_threads; i++)
+            setup_shaper(render_priv->worker_ctx[i]->shaper, render_priv);
+#endif
 
     // PAR correction
     double par = render_priv->settings.par;
@@ -3358,6 +3462,76 @@ static ASS_Image *ass_free_image(ASS_Image *img) {
     return next;
 }
 
+#if CONFIG_THREADS
+struct render_job {
+    RenderContext **ctx;
+    ASS_Event **events;
+    EventImages *out;
+    char *kept;
+};
+
+static void render_one_event(void *arg, size_t i, size_t worker_id)
+{
+    struct render_job *j = arg;
+    j->kept[i] = ass_render_event(j->ctx[worker_id], j->events[i], &j->out[i]) ? 1 : 0;
+}
+
+// Render all events active at `now` across the worker pool, compacting the
+// kept results into priv->eimg in event order. Returns the kept count, or -1
+// on allocation failure (caller falls back to serial rendering).
+static int render_events_parallel(ASS_Renderer *priv, ASS_Track *track,
+                                  long long now)
+{
+    int n_active = 0;
+    for (int i = 0; i < track->n_events; i++) {
+        ASS_Event *e = track->events + i;
+        if (e->Start <= now && now < e->Start + e->Duration)
+            n_active++;
+    }
+    if (n_active == 0)
+        return 0;
+
+    if (n_active > priv->eimg_size) {
+        EventImages *tmp = realloc(priv->eimg, n_active * sizeof(EventImages));
+        if (!tmp)
+            return -1;
+        priv->eimg = tmp;
+        priv->eimg_size = n_active;
+    }
+
+    ASS_Event **events = malloc(n_active * sizeof(*events));
+    char *kept = malloc(n_active);
+    if (!events || !kept) {
+        free(events);
+        free(kept);
+        return -1;
+    }
+
+    int k = 0;
+    for (int i = 0; i < track->n_events; i++) {
+        ASS_Event *e = track->events + i;
+        if (e->Start <= now && now < e->Start + e->Duration)
+            events[k++] = e;
+    }
+
+    struct render_job job = { priv->worker_ctx, events, priv->eimg, kept };
+    ass_thread_pool_run(priv->pool, n_active, render_one_event, &job);
+
+    int cnt = 0;
+    for (int i = 0; i < n_active; i++) {
+        if (kept[i]) {
+            if (i != cnt)
+                priv->eimg[cnt] = priv->eimg[i];
+            cnt++;
+        }
+    }
+
+    free(events);
+    free(kept);
+    return cnt;
+}
+#endif
+
 /**
  * \brief render a frame
  * \param priv library handle
@@ -3379,6 +3553,12 @@ ASS_Image *ass_render_frame(ASS_Renderer *priv, ASS_Track *track,
 
     // render events separately
     int cnt = 0;
+#if CONFIG_THREADS
+    int pcnt = priv->pool ? render_events_parallel(priv, track, now) : -1;
+    if (pcnt >= 0)
+        cnt = pcnt;
+    else
+#endif
     for (int i = 0; i < track->n_events; i++) {
         ASS_Event *event = track->events + i;
         if ((event->Start <= now)
@@ -3450,7 +3630,7 @@ void ass_frame_ref(ASS_Image *img)
 {
     if (!img)
         return;
-    ((ASS_ImagePriv *) img)->ref_count++;
+    ass_atomic_inc_size(&((ASS_ImagePriv *) img)->ref_count);
 }
 
 /**
@@ -3459,7 +3639,7 @@ void ass_frame_ref(ASS_Image *img)
  */
 void ass_frame_unref(ASS_Image *img)
 {
-    if (!img || --((ASS_ImagePriv *) img)->ref_count)
+    if (!img || ass_atomic_dec_size(&((ASS_ImagePriv *) img)->ref_count))
         return;
     do {
         img = ass_free_image(img);

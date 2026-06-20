@@ -35,6 +35,8 @@ AC_ARG_ENABLE([coretext], AS_HELP_STRING([--disable-coretext],
     [disable Core Text support (Apple only) @<:@default=check@:>@]))
 AC_ARG_ENABLE([libunibreak], AS_HELP_STRING([--disable-libunibreak],
     [disable libunibreak support @<:@default=check@:>@]))
+AC_ARG_ENABLE([threads], AS_HELP_STRING([--disable-threads],
+    [disable multithreaded rendering support @<:@default=check@:>@]))
 AC_ARG_ENABLE([require-system-font-provider], AS_HELP_STRING([--disable-require-system-font-provider],
     [allow compilation even if no system font provider was found @<:@default=enabled:>@]))
 AC_ARG_ENABLE([asm], AS_HELP_STRING([--disable-asm],
@@ -129,6 +131,38 @@ AS_IF([test "x$enable_libunibreak" != xno], [
     ], [
         AS_IF([test "x$enable_libunibreak" = xyes], [
             AC_MSG_ERROR([libunibreak support was requested, but it was not found.])
+        ])
+    ])
+])
+
+## Multithreading (pthreads; Win32 threads need no extra flag)
+threads=false
+AS_IF([test "x$enable_threads" != xno], [
+    AC_MSG_CHECKING([for thread support])
+    ax_save_CFLAGS="$CFLAGS"
+    ax_save_LIBS="$LIBS"
+    found_threads=no
+    # Try the common pthread flag, bare libpthread, then no flag (pthread in
+    # libc on modern glibc, or Win32 threads requiring nothing).
+    for ax_thread_flag in "-pthread" "-lpthread" ""; do
+        CFLAGS="$ax_save_CFLAGS $ax_thread_flag"
+        LIBS="$ax_save_LIBS $ax_thread_flag"
+        AC_LINK_IFELSE([AC_LANG_PROGRAM(
+            [[#include <pthread.h>
+              static void *worker(void *a) { return a; }]],
+            [[pthread_t t; pthread_create(&t, 0, worker, 0); pthread_join(t, 0);]])],
+            [found_threads=yes; break])
+    done
+    AS_IF([test "x$found_threads" = xyes], [
+        AC_MSG_RESULT([yes${ax_thread_flag:+ ($ax_thread_flag)}])
+        AC_DEFINE(CONFIG_THREADS, 1, [multithreaded rendering enabled])
+        threads=true
+    ], [
+        CFLAGS="$ax_save_CFLAGS"
+        LIBS="$ax_save_LIBS"
+        AC_MSG_RESULT([no])
+        AS_IF([test "x$enable_threads" = xyes], [
+            AC_MSG_ERROR([Multithreading support was requested, but no thread implementation was found.])
         ])
     ])
 ])
@@ -396,6 +430,8 @@ AM_CONDITIONAL([ENABLE_PROFILE], [test "x$enable_profile" = xyes])
 AM_CONDITIONAL([ENABLE_FUZZ], [test "x$enable_fuzz" = xyes])
 # tcc doesn't have the full support of __attribute__((aligned(32)))
 AM_CONDITIONAL([ENABLE_CHECKASM], [test "x$can_asm" = xtrue && test "x$GCC" = xyes])
+
+AM_CONDITIONAL([THREADS], [test "x$threads" = xtrue])
 
 AM_CONDITIONAL([FONTCONFIG], [test "x$fontconfig" = xtrue])
 AM_CONDITIONAL([CORETEXT], [test "x$coretext" = xtrue])

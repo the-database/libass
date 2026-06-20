@@ -39,6 +39,12 @@
 #include "ass_drawing.h"
 #include "ass_bitmap.h"
 #include "ass_rasterizer.h"
+#include "ass_threading.h"
+
+// Upper bound on the worker count chosen by auto (thread_count <= 0); typical
+// frames have only a handful of simultaneous events, so more workers than this
+// mostly just cost memory. An explicit count > 1 is not capped.
+#define ASS_AUTO_THREAD_CAP 8
 
 #define GLYPH_CACHE_MAX 10000
 #define MEGABYTE (1024 * 1024)
@@ -53,7 +59,7 @@ typedef struct {
     ASS_Image result;
     CompositeHashValue *source;
     unsigned char *buffer;
-    size_t ref_count;
+    ass_atomic_size_t ref_count;
 } ASS_ImagePriv;
 
 typedef struct {
@@ -77,6 +83,9 @@ typedef struct {
 
     char *default_font;
     char *default_family;
+
+    int render_thread_count;    // requested worker count: 1 = serial (default),
+                                // <= 0 = auto (CPU count), > 1 = that many
 } ASS_Settings;
 
 // a rendered event
@@ -338,6 +347,19 @@ struct ass_renderer {
     BitmapEngine engine;
 
     ASS_Style user_override_style;
+
+    // Recursive lock serializing all FreeType / fontselect / shaping access,
+    // which is not concurrency-safe (shared FT_Face / FT_Library / selector).
+    // No-op in non-threaded builds.
+    ass_rmutex_t font_lock;
+
+#if CONFIG_THREADS
+    // Worker pool and per-worker render contexts for parallel event rendering.
+    // pool == NULL means serial rendering using `state` (the default).
+    ASS_ThreadPool *pool;
+    RenderContext **worker_ctx;  // length == n_threads
+    int n_threads;               // active worker contexts (>= 1 when pool set)
+#endif
 };
 
 typedef struct render_priv {
@@ -355,6 +377,9 @@ typedef struct {
 void ass_reset_render_context(RenderContext *state, ASS_Style *style);
 void ass_frame_ref(ASS_Image *img);
 void ass_frame_unref(ASS_Image *img);
+#if CONFIG_THREADS
+void ass_renderer_update_pool(ASS_Renderer *priv);
+#endif
 ASS_Vector ass_layout_res(ASS_Renderer *render_priv);
 
 // XXX: this is actually in ass.c, includes should be fixed later on

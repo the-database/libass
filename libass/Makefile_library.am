@@ -50,6 +50,10 @@ libass_libass_internal_la_SOURCES += \
 endif
 endif
 
+if THREADS
+libass_libass_internal_la_SOURCES += libass/ass_threading.c
+endif
+
 if FONTCONFIG
 libass_libass_internal_la_SOURCES += libass/ass_fontconfig.h libass/ass_fontconfig.c
 endif
@@ -76,4 +80,5 @@ dist_assheaders_HEADERS = libass/ass_types.h libass/ass.h
 
 EXTRA_DIST += \
     libass/x86/x86inc.asm libass/x86/utils.asm \
+    libass/ass_threading.h \
     libass/libass.sym

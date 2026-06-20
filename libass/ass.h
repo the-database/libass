@@ -607,6 +607,31 @@ void ass_set_cache_limits(ASS_Renderer *priv, int glyph_max,
                           int bitmap_max_size);
 
 /**
+ * \brief Set the number of threads used to render events within a frame.
+ *
+ * Events active at a given timestamp are independent and can be rendered in
+ * parallel. Output is identical to single-threaded rendering regardless of the
+ * thread count. The default is 1 (no threads, identical to older versions).
+ *
+ * This is a no-op in builds compiled without thread support; the count then
+ * stays at 1.
+ *
+ * \param priv renderer handle
+ * \param threads number of worker threads: 1 for single-threaded (default),
+ *                a value <= 0 to pick automatically based on the CPU count,
+ *                or a specific count > 1
+ */
+void ass_set_render_thread_count(ASS_Renderer *priv, int threads);
+
+/**
+ * \brief Get the number of threads actually used for rendering.
+ * \param priv renderer handle
+ * \return the active worker thread count (always 1 if threading is disabled
+ *         at build time or not enabled at runtime)
+ */
+int ass_get_render_thread_count(ASS_Renderer *priv);
+
+/**
  * \brief Render a frame, producing a list of ASS_Image.
  * \param priv renderer handle
  * \param track subtitle track

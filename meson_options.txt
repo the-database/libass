@@ -12,6 +12,7 @@ option('directwrite', type: 'feature', description: 'DirectWrite support (win32 
 option('coretext', type: 'feature', description: 'Core Text support (Apple only)')
 option('asm', type: 'feature', description: 'ASM support (better performance)')
 option('libunibreak', type: 'feature', description: 'libunibreak support')
+option('threads', type: 'feature', description: 'Multithreaded rendering support')
 
 option('require-system-font-provider', type: 'boolean', value: true,
        description: 'disallow compilation if no system font provider was found')
