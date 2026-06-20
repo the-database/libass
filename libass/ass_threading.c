@@ -27,6 +27,7 @@
 #include "ass_threading.h"
 
 #ifdef _WIN32
+#include <process.h>  // _beginthreadex
 typedef HANDLE ass_native_thread_t;
 #else
 #include <unistd.h>
