@@ -241,9 +241,10 @@ size_t ass_face_size_metrics_construct(void *key, void *value, void *priv)
 
     FT_Face face = k->font->faces[k->face_index];
 
+    ass_rmutex_lock(k->font->lock);
     ass_face_set_size(face, k->size);
-
     memcpy(v, &face->size->metrics, sizeof(FT_Size_Metrics));
+    ass_rmutex_unlock(k->font->lock);
 
     return 1;
 }
@@ -258,14 +259,17 @@ size_t ass_glyph_metrics_construct(void *key, void *value, void *priv)
 
     FT_Face face = k->font->faces[k->face_index];
 
+    ass_rmutex_lock(k->font->lock);
     ass_face_set_size(face, k->size);
 
     if (FT_Load_Glyph(face, k->glyph_index, load_flags)) {
+        ass_rmutex_unlock(k->font->lock);
         v->width = -1;
         return 1;
     }
 
     memcpy(v, &face->glyph->metrics, sizeof(FT_Glyph_Metrics));
+    ass_rmutex_unlock(k->font->lock);
 
     if (priv)  // rotate
         v->horiAdvance = v->vertAdvance;
@@ -674,9 +678,15 @@ static bool shape_harfbuzz(ASS_Shaper *shaper, GlyphInfo *glyphs, size_t len)
         }
 
         int offset = i;
+        // Serialize all FT_Face / HarfBuzz access on this (renderer-wide)
+        // recursive lock; the cache constructs invoked by hb_shape re-enter it.
+        ass_rmutex_t *font_lock = glyphs[offset].font->lock;
+        ass_rmutex_lock(font_lock);
         hb_font_t *font = get_hb_font(shaper, glyphs + offset);
-        if (!font)
+        if (!font) {
+            ass_rmutex_unlock(font_lock);
             return false;
+        }
         int run_id = glyphs[offset].shape_run_id;
         int level = shaper->emblevels[offset];
 
@@ -719,6 +729,7 @@ static bool shape_harfbuzz(ASS_Shaper *shaper, GlyphInfo *glyphs, size_t len)
         hb_buffer_reset(buf);
 
         hb_font_destroy(font);
+        ass_rmutex_unlock(font_lock);
     }
 
     return true;
@@ -790,7 +801,10 @@ static void shape_fribidi(ASS_Shaper *shaper, GlyphInfo *glyphs, size_t len)
     fribidi_shape(FRIBIDI_FLAGS_DEFAULT | FRIBIDI_FLAGS_ARABIC,
             shaper->emblevels, len, joins, shaper->event_text);
 
-    // update indexes
+    // update indexes (FT_Face access; serialize on the renderer-wide font lock,
+    // which every glyph's font shares)
+    if (len)
+        ass_rmutex_lock(glyphs[0].font->lock);
     for (i = 0; i < len; i++) {
         GlyphInfo *info = glyphs + i;
         FT_Face face = info->font->faces[info->face_index];
@@ -799,6 +813,8 @@ static void shape_fribidi(ASS_Shaper *shaper, GlyphInfo *glyphs, size_t len)
         if (info->glyph_index)
             info->glyph_index = FT_Get_Char_Index(face, info->glyph_index);
     }
+    if (len)
+        ass_rmutex_unlock(glyphs[0].font->lock);
 
     free(joins);
 }

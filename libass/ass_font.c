@@ -504,13 +504,16 @@ size_t ass_font_construct(void *key, void *value, void *priv)
 
     font->library = render_priv->library;
     font->ftlibrary = render_priv->ftlibrary;
+    font->lock = &render_priv->font_lock;
     font->n_faces = 0;
     font->desc.family = desc->family;
     font->desc.bold = desc->bold;
     font->desc.italic = desc->italic;
     font->desc.vertical = desc->vertical;
 
+    ass_rmutex_lock(font->lock);
     int error = add_face(render_priv->fontselect, font, 0);
+    ass_rmutex_unlock(font->lock);
     if (error == -1)
         font->library = NULL;
     return 1;
@@ -657,6 +660,8 @@ int ass_font_get_index(ASS_FontSelector *fontsel, ASS_Font *font,
         return 0;
     }
 
+    ass_rmutex_lock(font->lock);
+
     for (i = 0; i < font->n_faces && index == 0; ++i) {
         face = font->faces[i];
         index = ass_font_index_magic(face, symbol);
@@ -698,6 +703,8 @@ int ass_font_get_index(ASS_FontSelector *fontsel, ASS_Font *font,
             }
         }
     }
+
+    ass_rmutex_unlock(font->lock);
 
     // FIXME: make sure we have a valid face_index. this is a HACK.
     *face_index  = FFMAX(*face_index, 0);
