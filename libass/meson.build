@@ -37,6 +37,7 @@ src_aarch64 = files(
     'aarch64/blur.S',
     'aarch64/rasterizer.S',
 )
+src_threading = files('ass_threading.c')
 src_fontconfig = files('ass_fontconfig.c')
 src_directwrite = files('ass_directwrite.c')
 src_coretext = files('ass_coretext.c')
@@ -72,6 +73,9 @@ libass_link_with = []
 
 libass_headers = files('ass.h', 'ass_types.h')
 
+if threads
+    libass_src += src_threading
+endif
 if fontconfig
     libass_src += src_fontconfig
 endif

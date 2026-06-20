@@ -29,6 +29,7 @@
 #include "ass_font.h"
 #include "ass_outline.h"
 #include "ass_cache.h"
+#include "ass_threading.h"
 
 // Always enable native-endian mode, since we don't care about cross-platform consistency of the hash
 #define WYHASH_LITTLE_ENDIAN 1
@@ -327,22 +328,45 @@ const CacheDesc glyph_metrics_cache_desc = {
 
 
 // Cache data
+//
+// The cache is split into N_CACHE_SHARDS independently locked shards, each with
+// its own hash map, LRU queue and size counter. A key's shard and bucket are
+// both derived from its hash, using disjoint bit ranges so the two are
+// independent. Sharding bounds lock contention when worker threads render
+// events in parallel; the total bucket count is kept close to the original
+// single-map size so per-shard chains stay short.
+//
+// Reference counting: an item's ref_count counts external holders plus one
+// while the item sits in its shard's LRU queue ("the queue reference").
+// Increments/decrements are lock-free atomics; only the final drop to zero
+// (which may free the item) and the LRU surgery take the shard lock.
+//
+// ass_cache_cut()/ass_cache_empty()/ass_cache_done() must only run while no
+// worker threads touch the cache (between frames); they manipulate shard state
+// without taking the locks, relying on that external serialization.
+
+#define N_CACHE_SHARDS      64     // must be a power of two
+#define CACHE_SHARD_BUCKETS 1024   // per shard, power of two (total ~= 65536)
+
 typedef struct cache_item {
-    Cache *cache;
+    struct cache_shard *shard;  // owning shard, or NULL once detached
     const CacheDesc *desc;
     struct cache_item *next, **prev;
     struct cache_item *queue_next, **queue_prev;
-    size_t size, ref_count;
+    size_t size;
+    ass_atomic_size_t ref_count;
 } CacheItem;
 
-struct cache {
-    unsigned buckets;
+typedef struct cache_shard {
+    ass_mutex_t mutex;
     CacheItem **map;
     CacheItem *queue_first, **queue_last;
-
-    const CacheDesc *desc;
-
     size_t cache_size;
+} CacheShard;
+
+struct cache {
+    const CacheDesc *desc;
+    CacheShard shards[N_CACHE_SHARDS];
 };
 
 #define CACHE_ALIGN 8
@@ -358,6 +382,15 @@ static inline CacheItem *value_to_item(void *value)
     return (CacheItem *) ((char *) value - CACHE_ITEM_SIZE);
 }
 
+// Map a hash to a shard and an in-shard bucket using disjoint bit ranges.
+static inline CacheShard *hash_to_shard(Cache *cache, ass_hashcode hash,
+                                        unsigned *bucket)
+{
+    *bucket = (unsigned) (hash & (CACHE_SHARD_BUCKETS - 1));
+    size_t idx = (size_t) (hash >> 40) & (N_CACHE_SHARDS - 1);
+    return &cache->shards[idx];
+}
+
 
 // Create a cache with type-specific hash/compare/destruct/size functions
 Cache *ass_cache_create(const CacheDesc *desc)
@@ -365,11 +398,25 @@ Cache *ass_cache_create(const CacheDesc *desc)
     Cache *cache = calloc(1, sizeof(*cache));
     if (!cache)
         return NULL;
-    cache->buckets = 0xFFFF;
-    cache->queue_last = &cache->queue_first;
     cache->desc = desc;
-    cache->map = calloc(cache->buckets, sizeof(CacheItem *));
-    if (!cache->map) {
+
+    size_t i;
+    for (i = 0; i < N_CACHE_SHARDS; i++) {
+        CacheShard *shard = &cache->shards[i];
+        shard->queue_last = &shard->queue_first;
+        if (ass_mutex_init(&shard->mutex) != 0)
+            break;
+        shard->map = calloc(CACHE_SHARD_BUCKETS, sizeof(CacheItem *));
+        if (!shard->map) {
+            ass_mutex_destroy(&shard->mutex);
+            break;
+        }
+    }
+    if (i < N_CACHE_SHARDS) {
+        for (size_t j = 0; j < i; j++) {
+            ass_mutex_destroy(&cache->shards[j].mutex);
+            free(cache->shards[j].map);
+        }
         free(cache);
         return NULL;
     }
@@ -377,74 +424,42 @@ Cache *ass_cache_create(const CacheDesc *desc)
     return cache;
 }
 
-// Retrieve a value corresponding to a particular cache key,
-// creating one if it does not already exist.
-// The returned item is guaranteed to be valid until the next ass_cache_cut call;
-// to extend its lifetime further, call ass_cache_inc_ref().
-void *ass_cache_get(Cache *cache, void *key, void *priv)
+// Find an item for key in the given bucket. Shard lock must be held.
+static inline CacheItem *find_item(CacheShard *shard, const CacheDesc *desc,
+                                   unsigned bucket, void *key, size_t key_offs)
 {
-    const CacheDesc *desc = cache->desc;
-    size_t key_offs = CACHE_ITEM_SIZE + align_cache(desc->value_size);
-    unsigned bucket = desc->hash_func(key, ASS_HASH_INIT) % cache->buckets;
-    CacheItem *item = cache->map[bucket];
+    CacheItem *item = shard->map[bucket];
     while (item) {
         if (desc->compare_func(key, (char *) item + key_offs)) {
             assert(item->size);
-            if (!item->queue_prev || item->queue_next) {
-                if (item->queue_prev) {
-                    item->queue_next->queue_prev = item->queue_prev;
-                    *item->queue_prev = item->queue_next;
-                } else
-                    item->ref_count++;
-                *cache->queue_last = item;
-                item->queue_prev = cache->queue_last;
-                cache->queue_last = &item->queue_next;
-                item->queue_next = NULL;
-            }
-            desc->key_move_func(NULL, key);
-
-            return (char *) item + CACHE_ITEM_SIZE;
+            return item;
         }
         item = item->next;
     }
-
-    item = malloc(key_offs + desc->key_size);
-    if (!item) {
-        desc->key_move_func(NULL, key);
-        return NULL;
-    }
-    item->cache = cache;
-    item->desc = desc;
-    void *new_key = (char *) item + key_offs;
-    if (!desc->key_move_func(new_key, key)) {
-        free(item);
-        return NULL;
-    }
-    void *value = (char *) item + CACHE_ITEM_SIZE;
-    item->size = desc->construct_func(new_key, value, priv);
-    assert(item->size);
-
-    CacheItem **bucketptr = &cache->map[bucket];
-    if (*bucketptr)
-        (*bucketptr)->prev = &item->next;
-    item->prev = bucketptr;
-    item->next = *bucketptr;
-    *bucketptr = item;
-
-    *cache->queue_last = item;
-    item->queue_prev = cache->queue_last;
-    cache->queue_last = &item->queue_next;
-    item->queue_next = NULL;
-    item->ref_count = 1;
-
-    cache->cache_size += item->size + (item->size == 1 ? 0 : CACHE_ITEM_SIZE);
-    return value;
+    return NULL;
 }
 
-void *ass_cache_key(void *value)
+// Append an item at the MRU tail of its shard queue. Shard lock must be held.
+static inline void queue_append(CacheShard *shard, CacheItem *item)
 {
-    CacheItem *item = value_to_item(value);
-    return (char *) value + align_cache(item->desc->value_size);
+    *shard->queue_last = item;
+    item->queue_prev = shard->queue_last;
+    shard->queue_last = &item->queue_next;
+    item->queue_next = NULL;
+}
+
+// Move an item to the MRU tail on access, re-acquiring the queue reference if
+// it had been evicted from the queue (orphaned). Shard lock must be held.
+static inline void promote_item(CacheShard *shard, CacheItem *item)
+{
+    if (!item->queue_prev || item->queue_next) {
+        if (item->queue_prev) {
+            item->queue_next->queue_prev = item->queue_prev;
+            *item->queue_prev = item->queue_next;
+        } else
+            ass_atomic_inc_size(&item->ref_count);
+        queue_append(shard, item);
+    }
 }
 
 static inline void destroy_item(const CacheDesc *desc, CacheItem *item)
@@ -455,13 +470,83 @@ static inline void destroy_item(const CacheDesc *desc, CacheItem *item)
     free(item);
 }
 
+// Retrieve a value corresponding to a particular cache key,
+// creating one if it does not already exist.
+// The returned item is guaranteed to be valid until the next ass_cache_cut call;
+// to extend its lifetime further, call ass_cache_inc_ref().
+void *ass_cache_get(Cache *cache, void *key, void *priv)
+{
+    const CacheDesc *desc = cache->desc;
+    size_t key_offs = CACHE_ITEM_SIZE + align_cache(desc->value_size);
+    unsigned bucket;
+    CacheShard *shard = hash_to_shard(cache, desc->hash_func(key, ASS_HASH_INIT),
+                                      &bucket);
+
+    ass_mutex_lock(&shard->mutex);
+    CacheItem *item = find_item(shard, desc, bucket, key, key_offs);
+    if (item) {
+        promote_item(shard, item);
+        ass_mutex_unlock(&shard->mutex);
+        desc->key_move_func(NULL, key);
+        return (char *) item + CACHE_ITEM_SIZE;
+    }
+    ass_mutex_unlock(&shard->mutex);
+
+    // Miss: build the item with the (potentially expensive, recursive)
+    // construct_func OUTSIDE the lock, then publish it.
+    item = malloc(key_offs + desc->key_size);
+    if (!item) {
+        desc->key_move_func(NULL, key);
+        return NULL;
+    }
+    item->shard = shard;
+    item->desc = desc;
+    void *new_key = (char *) item + key_offs;
+    if (!desc->key_move_func(new_key, key)) {
+        free(item);
+        return NULL;
+    }
+    void *value = (char *) item + CACHE_ITEM_SIZE;
+    item->size = desc->construct_func(new_key, value, priv);
+    assert(item->size);
+
+    ass_mutex_lock(&shard->mutex);
+    // Another thread may have inserted the same key while we built ours.
+    CacheItem *existing = find_item(shard, desc, bucket, new_key, key_offs);
+    if (existing) {
+        promote_item(shard, existing);
+        ass_mutex_unlock(&shard->mutex);
+        destroy_item(desc, item);
+        return (char *) existing + CACHE_ITEM_SIZE;
+    }
+
+    CacheItem **bucketptr = &shard->map[bucket];
+    if (*bucketptr)
+        (*bucketptr)->prev = &item->next;
+    item->prev = bucketptr;
+    item->next = *bucketptr;
+    *bucketptr = item;
+
+    queue_append(shard, item);
+    ass_atomic_store_size(&item->ref_count, 1);
+    shard->cache_size += item->size + (item->size == 1 ? 0 : CACHE_ITEM_SIZE);
+    ass_mutex_unlock(&shard->mutex);
+    return value;
+}
+
+void *ass_cache_key(void *value)
+{
+    CacheItem *item = value_to_item(value);
+    return (char *) value + align_cache(item->desc->value_size);
+}
+
 void ass_cache_inc_ref(void *value)
 {
     if (!value)
         return;
     CacheItem *item = value_to_item(value);
-    assert(item->size && item->ref_count);
-    item->ref_count++;
+    assert(item->size && ass_atomic_load_size(&item->ref_count));
+    ass_atomic_inc_size(&item->ref_count);
 }
 
 void ass_cache_dec_ref(void *value)
@@ -469,34 +554,43 @@ void ass_cache_dec_ref(void *value)
     if (!value)
         return;
     CacheItem *item = value_to_item(value);
-    assert(item->size && item->ref_count);
-    if (--item->ref_count)
+    assert(item->size);
+    if (ass_atomic_dec_size(&item->ref_count))
         return;
 
-    Cache *cache = item->cache;
-    if (cache) {
+    // The count reached zero. A concurrent ass_cache_get() hit may still
+    // resurrect the item (orphan re-reference), so re-check under the shard
+    // lock before unlinking and destroying it.
+    CacheShard *shard = item->shard;
+    if (shard) {
+        ass_mutex_lock(&shard->mutex);
+        if (ass_atomic_load_size(&item->ref_count)) {
+            ass_mutex_unlock(&shard->mutex);
+            return;
+        }
         if (item->next)
             item->next->prev = item->prev;
         *item->prev = item->next;
-
-        cache->cache_size -= item->size + (item->size == 1 ? 0 : CACHE_ITEM_SIZE);
+        shard->cache_size -= item->size + (item->size == 1 ? 0 : CACHE_ITEM_SIZE);
+        ass_mutex_unlock(&shard->mutex);
     }
     destroy_item(item->desc, item);
 }
 
-void ass_cache_cut(Cache *cache, size_t max_size)
+// Evict least-recently-used items from one shard. Caller-serialized (no lock).
+static void cut_shard(CacheShard *shard, size_t max_size)
 {
-    if (cache->cache_size <= max_size)
+    if (shard->cache_size <= max_size)
         return;
 
     do {
-        CacheItem *item = cache->queue_first;
+        CacheItem *item = shard->queue_first;
         if (!item)
             break;
         assert(item->size);
 
-        cache->queue_first = item->queue_next;
-        if (--item->ref_count) {
+        shard->queue_first = item->queue_next;
+        if (ass_atomic_dec_size(&item->ref_count)) {
             item->queue_prev = NULL;
             continue;
         }
@@ -505,42 +599,54 @@ void ass_cache_cut(Cache *cache, size_t max_size)
             item->next->prev = item->prev;
         *item->prev = item->next;
 
-        cache->cache_size -= item->size + (item->size == 1 ? 0 : CACHE_ITEM_SIZE);
-        destroy_item(cache->desc, item);
-    } while (cache->cache_size > max_size);
-    if (cache->queue_first)
-        cache->queue_first->queue_prev = &cache->queue_first;
+        shard->cache_size -= item->size + (item->size == 1 ? 0 : CACHE_ITEM_SIZE);
+        destroy_item(item->desc, item);
+    } while (shard->cache_size > max_size);
+    if (shard->queue_first)
+        shard->queue_first->queue_prev = &shard->queue_first;
     else
-        cache->queue_last = &cache->queue_first;
+        shard->queue_last = &shard->queue_first;
+}
+
+void ass_cache_cut(Cache *cache, size_t max_size)
+{
+    size_t shard_max = max_size / N_CACHE_SHARDS;
+    for (size_t i = 0; i < N_CACHE_SHARDS; i++)
+        cut_shard(&cache->shards[i], shard_max);
 }
 
 void ass_cache_empty(Cache *cache)
 {
-    for (int i = 0; i < cache->buckets; i++) {
-        CacheItem *item = cache->map[i];
-        while (item) {
-            assert(item->size);
-            CacheItem *next = item->next;
-            if (item->queue_prev)
-                item->ref_count--;
-            if (item->ref_count)
-                item->cache = NULL;
-            else
-                destroy_item(cache->desc, item);
-            item = next;
+    for (size_t s = 0; s < N_CACHE_SHARDS; s++) {
+        CacheShard *shard = &cache->shards[s];
+        for (unsigned i = 0; i < CACHE_SHARD_BUCKETS; i++) {
+            CacheItem *item = shard->map[i];
+            while (item) {
+                assert(item->size);
+                CacheItem *next = item->next;
+                if (item->queue_prev)
+                    ass_atomic_dec_size(&item->ref_count);
+                if (ass_atomic_load_size(&item->ref_count))
+                    item->shard = NULL;
+                else
+                    destroy_item(item->desc, item);
+                item = next;
+            }
+            shard->map[i] = NULL;
         }
-        cache->map[i] = NULL;
+        shard->queue_first = NULL;
+        shard->queue_last = &shard->queue_first;
+        shard->cache_size = 0;
     }
-
-    cache->queue_first = NULL;
-    cache->queue_last = &cache->queue_first;
-    cache->cache_size = 0;
 }
 
 void ass_cache_done(Cache *cache)
 {
     ass_cache_empty(cache);
-    free(cache->map);
+    for (size_t s = 0; s < N_CACHE_SHARDS; s++) {
+        ass_mutex_destroy(&cache->shards[s].mutex);
+        free(cache->shards[s].map);
+    }
     free(cache);
 }
 

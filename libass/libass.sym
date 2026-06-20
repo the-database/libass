@@ -48,3 +48,5 @@ ass_malloc
 ass_free
 ass_prune_events
 ass_configure_prune
+ass_set_render_thread_count
+ass_get_render_thread_count

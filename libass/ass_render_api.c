@@ -137,6 +137,25 @@ void ass_set_line_spacing(ASS_Renderer *priv, double line_spacing)
     priv->settings.line_spacing = line_spacing;
 }
 
+void ass_set_render_thread_count(ASS_Renderer *priv, int threads)
+{
+    if (priv->settings.render_thread_count == threads)
+        return;
+    priv->settings.render_thread_count = threads;
+#if CONFIG_THREADS
+    ass_renderer_update_pool(priv);
+#endif
+}
+
+int ass_get_render_thread_count(ASS_Renderer *priv)
+{
+#if CONFIG_THREADS
+    return priv->pool ? priv->n_threads : 1;
+#else
+    return 1;
+#endif
+}
+
 void ass_set_line_position(ASS_Renderer *priv, double line_position)
 {
     if (priv->settings.line_position != line_position) {
