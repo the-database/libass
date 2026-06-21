@@ -22,6 +22,7 @@
 #include "config.h"
 
 #include <stddef.h>
+#include <stdbool.h>
 
 /*
  * This header provides two layers:
@@ -177,10 +178,16 @@ size_t ass_thread_pool_nthreads(ASS_ThreadPool *pool);
 // Run task(arg, index, worker_id) for every index in [0, count) across the
 // pool's workers, then block until all have finished. The calling thread also
 // participates as a worker. Output slots are caller-partitioned by index, so
-// completion order does not affect results.
+// completion order does not affect results. Nestable: a task may itself call
+// this (a thread waiting for its tasks helps run others meanwhile).
+//
+// exclusive marks tasks that own the executing thread's per-thread scratch
+// (worker_id-indexed): a thread already running one will not start another, so
+// such tasks never run nested on the same thread. Non-exclusive tasks (e.g.
+// blur stripes) may be helped from anywhere.
 void ass_thread_pool_run(ASS_ThreadPool *pool, size_t count,
                          void (*task)(void *arg, size_t index, size_t worker_id),
-                         void *arg);
+                         void *arg, bool exclusive);
 
 // Number of online logical CPUs, clamped to >= 1.
 size_t ass_get_cpu_count(void);

@@ -34,69 +34,109 @@ typedef HANDLE ass_native_thread_t;
 typedef pthread_t ass_native_thread_t;
 #endif
 
-struct ass_thread_pool {
-    ass_mutex_t lock;
-    ass_cond_t  work_cond;   // wake workers when a job is posted
-    ass_cond_t  done_cond;   // notify the dispatcher when a job completes
+#include <stdint.h>
 
-    size_t n_threads;        // total parallelism, including the dispatcher
-    size_t n_workers;        // spawned worker threads (== n_threads - 1)
-    ass_native_thread_t *threads;
+#if defined(_MSC_VER)
+#define ASS_TLS __declspec(thread)
+#else
+#define ASS_TLS __thread
+#endif
 
-    // Current job. next_index is claimed lock-free via fetch-add.
-    void (*task)(void *arg, size_t index, size_t worker_id);
+// One outstanding parallel_for. Regions live on their owner's stack and are
+// linked into the pool's active list while running. Several can be active at
+// once (e.g. blur regions from different events rendering in parallel).
+typedef struct task_region {
+    void (*fn)(void *arg, size_t index, size_t thread_id);
     void *arg;
     size_t count;
-    ass_atomic_size_t next_index;
+    size_t next;                  // next unclaimed index (guarded by pool->lock)
+    ass_atomic_size_t done;       // completed count (atomic; read lock-free)
+    bool exclusive;               // task owns the thread's per-thread scratch,
+                                  // so a thread may run only one at a time
+    struct task_region *prev, *nxt;
+} TaskRegion;
 
-    size_t generation;       // bumped once per dispatched job
-    size_t active_workers;   // spawned workers still processing this job
-    size_t ready_workers;    // workers that have entered their wait loop
+struct ass_thread_pool {
+    ass_mutex_t lock;
+    ass_cond_t  cond;             // new work, region progress, or shutdown
+    size_t n_threads;             // total parallelism incl. the caller's slot
+    size_t n_workers;             // spawned worker threads (== n_threads - 1)
+    ass_native_thread_t *threads;
+    TaskRegion *head;             // most-recently pushed active region
+    size_t ready_workers;
     bool   shutdown;
 };
+
+// Stable per-thread id, used to index per-thread scratch (RenderContext).
+// SIZE_MAX marks a thread that is not a pool worker (an outside caller).
+static ASS_TLS size_t tls_thread_id = SIZE_MAX;
+
+// How many exclusive tasks the current thread is nested in. While > 0 it may
+// not start another exclusive task (that would reuse its per-thread scratch),
+// but it may still help with non-exclusive work (e.g. blur stripes).
+static ASS_TLS int tls_excl_depth;
 
 struct worker_arg {
     ASS_ThreadPool *pool;
     size_t worker_id;
 };
 
-// Claim and run indices until the job is exhausted.
-static void run_job(ASS_ThreadPool *pool, size_t worker_id)
+// Find the first active region with an unclaimed index and claim it.
+// Caller must hold pool->lock. Returns NULL if no work is currently claimable.
+static TaskRegion *claim_index(ASS_ThreadPool *pool, size_t *out_idx)
 {
-    for (;;) {
-        size_t idx = ass_atomic_inc_size(&pool->next_index) - 1;
-        if (idx >= pool->count)
-            break;
-        pool->task(pool->arg, idx, worker_id);
+    for (TaskRegion *r = pool->head; r; r = r->nxt) {
+        if (r->exclusive && tls_excl_depth)
+            continue;   // can't nest a second exclusive task on this thread
+        if (r->next < r->count) {
+            *out_idx = r->next++;
+            return r;
+        }
     }
+    return NULL;
+}
+
+// Run one claimed task. Enters and leaves with pool->lock held, but drops it
+// while executing the task body.
+static void run_claimed(ASS_ThreadPool *pool, TaskRegion *r, size_t idx,
+                        size_t my_id)
+{
+    ass_mutex_unlock(&pool->lock);
+    size_t saved = tls_thread_id;
+    tls_thread_id = my_id;
+    if (r->exclusive)
+        tls_excl_depth++;
+    r->fn(r->arg, idx, my_id);
+    if (r->exclusive)
+        tls_excl_depth--;
+    tls_thread_id = saved;
+    size_t d = ass_atomic_inc_size(&r->done);
+    ass_mutex_lock(&pool->lock);
+    if (d == r->count)
+        ass_cond_broadcast(&pool->cond);   // the region's owner may be waiting
 }
 
 static void worker_loop(ASS_ThreadPool *pool, size_t worker_id)
 {
+    tls_thread_id = worker_id;
     ass_mutex_lock(&pool->lock);
-    size_t seen = pool->generation;
 
-    // Announce readiness so pool creation can't return (and thus no job can
-    // be posted) until every worker is parked in the wait below. This pins
-    // each worker's `seen` baseline before the first generation bump. The
-    // creator re-checks the count, so we just bump and signal here (never
-    // reading n_workers, which the creator may still be finalizing).
+    // Announce readiness so pool creation can't return (and thus no job can be
+    // posted) before every worker is parked here. The creator re-checks the
+    // count, so we never read n_workers (which it may still be finalizing).
     pool->ready_workers++;
-    ass_cond_signal(&pool->done_cond);
+    ass_cond_broadcast(&pool->cond);
 
     for (;;) {
-        while (!pool->shutdown && pool->generation == seen)
-            ass_cond_wait(&pool->work_cond, &pool->lock);
+        size_t idx;
+        TaskRegion *r = claim_index(pool, &idx);
+        if (r) {
+            run_claimed(pool, r, idx, worker_id);
+            continue;
+        }
         if (pool->shutdown)
             break;
-        seen = pool->generation;
-        ass_mutex_unlock(&pool->lock);
-
-        run_job(pool, worker_id);
-
-        ass_mutex_lock(&pool->lock);
-        if (--pool->active_workers == 0)
-            ass_cond_signal(&pool->done_cond);
+        ass_cond_wait(&pool->cond, &pool->lock);
     }
     ass_mutex_unlock(&pool->lock);
 }
@@ -153,14 +193,10 @@ ASS_ThreadPool *ass_thread_pool_create(size_t n_threads)
 
     pool->n_threads = n_threads;
     pool->n_workers = n_threads - 1;
-    pool->generation = 0;
 
     bool lock_ok = ass_mutex_init(&pool->lock) == 0;
-    bool work_ok = lock_ok && ass_cond_init(&pool->work_cond) == 0;
-    bool done_ok = work_ok && ass_cond_init(&pool->done_cond) == 0;
-    if (!done_ok) {
-        if (work_ok)
-            ass_cond_destroy(&pool->work_cond);
+    bool cond_ok = lock_ok && ass_cond_init(&pool->cond) == 0;
+    if (!cond_ok) {
         if (lock_ok)
             ass_mutex_destroy(&pool->lock);
         free(pool);
@@ -195,7 +231,7 @@ ASS_ThreadPool *ass_thread_pool_create(size_t n_threads)
         ass_mutex_lock(&pool->lock);
         pool->n_workers = started;
         while (pool->ready_workers < started)
-            ass_cond_wait(&pool->done_cond, &pool->lock);
+            ass_cond_wait(&pool->cond, &pool->lock);
         ass_mutex_unlock(&pool->lock);
 
         pool->n_threads = started + 1;
@@ -212,7 +248,7 @@ void ass_thread_pool_destroy(ASS_ThreadPool *pool)
     if (pool->n_workers) {
         ass_mutex_lock(&pool->lock);
         pool->shutdown = true;
-        ass_cond_broadcast(&pool->work_cond);
+        ass_cond_broadcast(&pool->cond);
         ass_mutex_unlock(&pool->lock);
 
         for (size_t i = 0; i < pool->n_workers; i++)
@@ -220,8 +256,7 @@ void ass_thread_pool_destroy(ASS_ThreadPool *pool)
     }
     free(pool->threads);
 
-    ass_cond_destroy(&pool->done_cond);
-    ass_cond_destroy(&pool->work_cond);
+    ass_cond_destroy(&pool->cond);
     ass_mutex_destroy(&pool->lock);
     free(pool);
 }
@@ -231,39 +266,67 @@ size_t ass_thread_pool_nthreads(ASS_ThreadPool *pool)
     return pool->n_threads;
 }
 
+// Nestable parallel-for: runs task(arg, index, thread_id) for index in
+// [0, count). Safe to call from an outside thread OR from within a running
+// task (a worker), because a thread waiting for its own region to finish
+// helps execute any other claimable work meanwhile, so nesting cannot
+// deadlock. thread_id is the executing thread's stable slot, usable to index
+// per-thread scratch.
 void ass_thread_pool_run(ASS_ThreadPool *pool, size_t count,
                          void (*task)(void *arg, size_t index, size_t worker_id),
-                         void *arg)
+                         void *arg, bool exclusive)
 {
     if (!count)
         return;
 
-    // Without spawned workers, run inline on the calling thread.
+    size_t my_id = tls_thread_id;
+    bool external = my_id == SIZE_MAX;
+    if (external)
+        my_id = pool->n_workers;   // the outside caller's stable slot
+
+    // No helper threads: run inline.
     if (!pool->n_workers) {
-        pool->task = task;
-        pool->arg = arg;
-        pool->count = count;
-        ass_atomic_store_size(&pool->next_index, 0);
-        run_job(pool, 0);
+        size_t saved = tls_thread_id;
+        tls_thread_id = my_id;
+        for (size_t i = 0; i < count; i++)
+            task(arg, i, my_id);
+        tls_thread_id = saved;
         return;
     }
 
-    ass_mutex_lock(&pool->lock);
-    pool->task = task;
-    pool->arg = arg;
-    pool->count = count;
-    ass_atomic_store_size(&pool->next_index, 0);
-    pool->active_workers = pool->n_workers;
-    pool->generation++;
-    ass_cond_broadcast(&pool->work_cond);
-    ass_mutex_unlock(&pool->lock);
-
-    // The dispatcher participates as the highest-numbered worker.
-    run_job(pool, pool->n_workers);
+    TaskRegion r = { .fn = task, .arg = arg, .count = count, .next = 0,
+                     .exclusive = exclusive };
+    ass_atomic_store_size(&r.done, 0);
 
     ass_mutex_lock(&pool->lock);
-    while (pool->active_workers > 0)
-        ass_cond_wait(&pool->done_cond, &pool->lock);
+    // Publish at the list head and wake idle workers to help.
+    r.prev = NULL;
+    r.nxt = pool->head;
+    if (pool->head)
+        pool->head->prev = &r;
+    pool->head = &r;
+    ass_cond_broadcast(&pool->cond);
+
+    // Help until this region is fully done; drain other regions while waiting.
+    for (;;) {
+        size_t idx;
+        TaskRegion *pr = claim_index(pool, &idx);
+        if (pr) {
+            run_claimed(pool, pr, idx, my_id);
+            continue;
+        }
+        if (ass_atomic_load_size(&r.done) == count)
+            break;
+        ass_cond_wait(&pool->cond, &pool->lock);
+    }
+
+    // Unlink our region.
+    if (r.prev)
+        r.prev->nxt = r.nxt;
+    else
+        pool->head = r.nxt;
+    if (r.nxt)
+        r.nxt->prev = r.prev;
     ass_mutex_unlock(&pool->lock);
 }
 

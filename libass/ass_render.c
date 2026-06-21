@@ -2846,9 +2846,14 @@ size_t ass_composite_construct(void *key, void *value, void *priv)
     int flags = k->filter.flags;
     double r2x = restore_blur(k->filter.blur_x);
     double r2y = restore_blur(k->filter.blur_y);
+#if CONFIG_THREADS
+    void *blur_pool = render_priv->pool;
+#else
+    void *blur_pool = NULL;
+#endif
     if (!(flags & FILTER_NONZERO_BORDER) || (flags & FILTER_BORDER_STYLE_3))
-        ass_synth_blur(&render_priv->engine, &v->bm, k->filter.be, r2x, r2y);
-    ass_synth_blur(&render_priv->engine, &v->bm_o, k->filter.be, r2x, r2y);
+        ass_synth_blur(&render_priv->engine, blur_pool, &v->bm, k->filter.be, r2x, r2y);
+    ass_synth_blur(&render_priv->engine, blur_pool, &v->bm_o, k->filter.be, r2x, r2y);
 
     if (!(flags & FILTER_FILL_IN_BORDER) && !(flags & FILTER_FILL_IN_SHADOW))
         ass_fix_outline(&v->bm, &v->bm_o);
@@ -3541,7 +3546,7 @@ static int render_events_parallel(ASS_Renderer *priv, ASS_Track *track,
     }
 
     struct render_job job = { priv->worker_ctx, events, priv->eimg, kept };
-    ass_thread_pool_run(priv->pool, n_active, render_one_event, &job);
+    ass_thread_pool_run(priv->pool, n_active, render_one_event, &job, true);
 
     int cnt = 0;
     for (int i = 0; i < n_active; i++) {
