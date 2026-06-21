@@ -24,6 +24,132 @@
 
 #include "ass_utils.h"
 #include "ass_bitmap.h"
+#include "ass_threading.h"
+
+// Stripe-parallel blur: the unpack and all vertical stages operate on
+// independent vertical stripes, so they split bit-exactly across worker
+// threads (each band is a contiguous range of stripes; the engine functions
+// are called on offset sub-buffers). Only worthwhile for large bitmaps.
+enum vstage { VS_SHRINK, VS_BLUR, VS_EXPAND };
+
+#if CONFIG_THREADS
+#define PARALLEL_BLUR_MIN_AREA (256 * 1024)
+
+struct vert_job {
+    const BitmapEngine *engine;
+    int16_t *dst, *src;
+    size_t src_height, dst_height;   // per-stripe lengths (== STRIPE_WIDTH * height)
+    int n_stripes, stripe_w, n_bands;
+    enum vstage stage;
+    const int16_t *param;            // VS_BLUR only
+    int radius;                      // VS_BLUR only
+};
+
+// Map band -> [col0, col0+colw). Band starts are aligned to 2-stripe groups so
+// col0 is a multiple of ALIGNMENT (== 2 * stripe width): the unpack source is a
+// byte bitmap and the engine functions require ALIGNMENT-aligned pointers.
+static void band_cols(size_t band, int n_bands, int n_stripes, int sw,
+                      int *col0, int *colw)
+{
+    int groups = (n_stripes + 1) / 2;
+    int gpb = (groups + n_bands - 1) / n_bands;
+    int g0 = (int) band * gpb;
+    int g1 = g0 + gpb;
+    if (g0 > groups) g0 = groups;
+    if (g1 > groups) g1 = groups;
+    int s0 = 2 * g0;
+    int s1 = 2 * g1;
+    if (s1 > n_stripes) s1 = n_stripes;
+    if (s0 > n_stripes) s0 = n_stripes;
+    *col0 = s0 * sw;
+    *colw = (s1 - s0) * sw;
+}
+
+static void vert_task(void *arg, size_t band, size_t thread_id)
+{
+    (void) thread_id;
+    struct vert_job *j = arg;
+    int col0, colw;
+    band_cols(band, j->n_bands, j->n_stripes, j->stripe_w, &col0, &colw);
+    if (!colw)
+        return;
+    int s0 = col0 / j->stripe_w;
+    int16_t *src = j->src + (size_t) s0 * j->stripe_w * j->src_height;
+    int16_t *dst = j->dst + (size_t) s0 * j->stripe_w * j->dst_height;
+    switch (j->stage) {
+    case VS_SHRINK:
+        j->engine->shrink_vert(dst, src, colw, j->src_height);
+        break;
+    case VS_BLUR:
+        j->engine->blur_vert[j->radius - 4](dst, src, colw, j->src_height, j->param);
+        break;
+    case VS_EXPAND:
+        j->engine->expand_vert(dst, src, colw, j->src_height);
+        break;
+    }
+}
+
+struct unpack_job {
+    const BitmapEngine *engine;
+    int16_t *dst;
+    const uint8_t *src;
+    ptrdiff_t src_stride;
+    size_t height;
+    int n_stripes, stripe_w, n_bands;
+};
+
+static void unpack_task(void *arg, size_t band, size_t thread_id)
+{
+    (void) thread_id;
+    struct unpack_job *j = arg;
+    int col0, colw;
+    band_cols(band, j->n_bands, j->n_stripes, j->stripe_w, &col0, &colw);
+    if (!colw)
+        return;
+    int s0 = col0 / j->stripe_w;
+    j->engine->stripe_unpack(j->dst + (size_t) s0 * j->stripe_w * j->height,
+                             j->src + col0, j->src_stride, colw, j->height);
+}
+
+// Band count for a stage of width w, clamped to the pool size and stripe count.
+static int blur_bands(void *pool, uint32_t w, int stripe_w)
+{
+    int n_stripes = (w + stripe_w - 1) / stripe_w;
+    int n = (int) ass_thread_pool_nthreads((ASS_ThreadPool *) pool);
+    if (n > n_stripes)
+        n = n_stripes;
+    return n < 1 ? 1 : n;
+}
+
+#endif // CONFIG_THREADS
+
+// Run one vertical stage, parallel across stripe bands when a pool with >1
+// band is given, else inline (identical to the direct engine call).
+static void do_vert(void *pool, int n_bands, const BitmapEngine *engine,
+                    int16_t *dst, int16_t *src, uint32_t w, uint32_t src_h,
+                    uint32_t dst_h, enum vstage stage, const int16_t *param,
+                    int radius, int stripe_w)
+{
+#if CONFIG_THREADS
+    if (pool && n_bands > 1) {
+        struct vert_job j = {
+            engine, dst, src, src_h, dst_h,
+            (w + stripe_w - 1) / stripe_w, stripe_w, n_bands, stage, param, radius,
+        };
+        if (j.n_bands > j.n_stripes)
+            j.n_bands = j.n_stripes < 1 ? 1 : j.n_stripes;
+        ass_thread_pool_run((ASS_ThreadPool *) pool, j.n_bands, vert_task, &j, false);
+        return;
+    }
+#else
+    (void) pool; (void) n_bands; (void) dst_h; (void) stripe_w;
+#endif
+    switch (stage) {
+    case VS_SHRINK: engine->shrink_vert(dst, src, w, src_h); break;
+    case VS_BLUR:   engine->blur_vert[radius - 4](dst, src, w, src_h, param); break;
+    case VS_EXPAND: engine->expand_vert(dst, src, w, src_h); break;
+    }
+}
 
 
 /*
@@ -170,7 +296,8 @@ static void find_best_method(BlurMethod *blur, double r2)
  * \param r2x in: desired standard deviation along X axis squared
  * \param r2y in: desired standard deviation along Y axis squared
  */
-bool ass_gaussian_blur(const BitmapEngine *engine, Bitmap *bm, double r2x, double r2y)
+bool ass_gaussian_blur(const BitmapEngine *engine, void *pool, Bitmap *bm,
+                       double r2x, double r2y)
 {
     BlurMethod blur_x, blur_y;
     find_best_method(&blur_x, r2x);
@@ -193,12 +320,31 @@ bool ass_gaussian_blur(const BitmapEngine *engine, Bitmap *bm, double r2x, doubl
     if (!tmp)
         return false;
 
-    engine->stripe_unpack(tmp, bm->buffer, bm->stride, w, h);
+    // Only split large bitmaps; small glyphs aren't worth the dispatch cost.
+    int n_bands = 1;
+#if CONFIG_THREADS
+    if (pool && (uint64_t) end_w * end_h >= PARALLEL_BLUR_MIN_AREA)
+        n_bands = blur_bands(pool, end_w, stripe_width);
+#endif
+
+#if CONFIG_THREADS
+    if (n_bands > 1) {
+        struct unpack_job j = {
+            engine, tmp, bm->buffer, bm->stride, h,
+            (w + stripe_width - 1) / stripe_width, stripe_width, n_bands,
+        };
+        if (j.n_bands > j.n_stripes)
+            j.n_bands = j.n_stripes < 1 ? 1 : j.n_stripes;
+        ass_thread_pool_run((ASS_ThreadPool *) pool, j.n_bands, unpack_task, &j, false);
+    } else
+#endif
+        engine->stripe_unpack(tmp, bm->buffer, bm->stride, w, h);
     int16_t *buf[2] = {tmp, tmp + size};
     int index = 0;
 
     for (int i = 0; i < blur_y.level; i++) {
-        engine->shrink_vert(buf[index ^ 1], buf[index], w, h);
+        do_vert(pool, n_bands, engine, buf[index ^ 1], buf[index], w, h,
+                (h + 5) >> 1, VS_SHRINK, NULL, 0, stripe_width);
         h = (h + 5) >> 1;
         index ^= 1;
     }
@@ -212,7 +358,8 @@ bool ass_gaussian_blur(const BitmapEngine *engine, Bitmap *bm, double r2x, doubl
     w += 2 * blur_x.radius;
     index ^= 1;
     assert(blur_y.radius >= 4 && blur_y.radius <= 8);
-    engine->blur_vert[blur_y.radius - 4](buf[index ^ 1], buf[index], w, h, blur_y.coeff);
+    do_vert(pool, n_bands, engine, buf[index ^ 1], buf[index], w, h,
+            h + 2 * blur_y.radius, VS_BLUR, blur_y.coeff, blur_y.radius, stripe_width);
     h += 2 * blur_y.radius;
     index ^= 1;
     for (int i = 0; i < blur_x.level; i++) {
@@ -221,7 +368,8 @@ bool ass_gaussian_blur(const BitmapEngine *engine, Bitmap *bm, double r2x, doubl
         index ^= 1;
     }
     for (int i = 0; i < blur_y.level; i++) {
-        engine->expand_vert(buf[index ^ 1], buf[index], w, h);
+        do_vert(pool, n_bands, engine, buf[index ^ 1], buf[index], w, h,
+                2 * h + 4, VS_EXPAND, NULL, 0, stripe_width);
         h = 2 * h + 4;
         index ^= 1;
     }
