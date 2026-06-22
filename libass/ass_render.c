@@ -2865,6 +2865,74 @@ int ass_be_padding(int be)
 }
 
 
+#if CONFIG_THREADS
+struct combine_job {
+    const BitmapEngine *engine;
+    Bitmap *dst;
+    BitmapRef *bitmaps;
+    int count;
+    int nbands;
+    bool outline;
+};
+
+// Add every source bitmap's rows that fall in this output band. Bands are
+// disjoint row ranges of dst, so tasks never touch the same pixel.
+static void combine_band(void *arg, size_t band, size_t worker_id)
+{
+    struct combine_job *j = arg;
+    Bitmap *dst = j->dst;
+    int y0 = (int)((long long) band       * dst->h / j->nbands);
+    int y1 = (int)((long long)(band + 1)  * dst->h / j->nbands);
+    for (int i = 0; i < j->count; i++) {
+        Bitmap *src = j->outline ? j->bitmaps[i].bm_o : j->bitmaps[i].bm;
+        if (!src)
+            continue;
+        ASS_Vector pos = j->outline ? j->bitmaps[i].pos_o : j->bitmaps[i].pos;
+        int x = pos.x + src->left - dst->left;
+        int y = pos.y + src->top  - dst->top;
+        int r0 = y > y0 ? y : y0;
+        int r1 = y + src->h < y1 ? y + src->h : y1;
+        if (r1 <= r0)
+            continue;
+        unsigned char *buf = dst->buffer + (ptrdiff_t) r0 * dst->stride + x;
+        j->engine->add_bitmaps(buf, dst->stride,
+                               src->buffer + (ptrdiff_t)(r0 - y) * src->stride,
+                               src->stride, src->w, r1 - r0);
+    }
+}
+#endif
+
+// Combine all source fill (outline=false) or border (outline=true) bitmaps into
+// dst. For large composites this is the serial floor on a heavy single-run
+// event, so band it across the worker pool; bit-exact with the serial add.
+static void combine_bitmaps(ASS_Renderer *render_priv, Bitmap *dst,
+                            BitmapRef *bitmaps, int count, bool outline)
+{
+#if CONFIG_THREADS
+    if (render_priv->pool && dst->h >= 16 && (long long) dst->h * count >= 4096) {
+        int nbands = render_priv->n_threads;
+        if (nbands > dst->h)
+            nbands = dst->h;
+        struct combine_job job = {
+            &render_priv->engine, dst, bitmaps, count, nbands, outline,
+        };
+        ass_thread_pool_run(render_priv->pool, nbands, combine_band, &job, false);
+        return;
+    }
+#endif
+    for (int i = 0; i < count; i++) {
+        Bitmap *src = outline ? bitmaps[i].bm_o : bitmaps[i].bm;
+        if (!src)
+            continue;
+        ASS_Vector pos = outline ? bitmaps[i].pos_o : bitmaps[i].pos;
+        int x = pos.x + src->left - dst->left;
+        int y = pos.y + src->top  - dst->top;
+        unsigned char *buf = dst->buffer + (ptrdiff_t) y * dst->stride + x;
+        render_priv->engine.add_bitmaps(buf, dst->stride,
+                                        src->buffer, src->stride, src->w, src->h);
+    }
+}
+
 size_t ass_composite_construct(void *key, void *value, void *priv)
 {
     ASS_Renderer *render_priv = priv;
@@ -2904,19 +2972,7 @@ size_t ass_composite_construct(void *key, void *value, void *priv)
         Bitmap *dst = &v->bm;
         dst->left = rect.x_min - bord;
         dst->top  = rect.y_min - bord;
-        for (int i = 0; i < k->bitmap_count; i++) {
-            Bitmap *src = k->bitmaps[i].bm;
-            if (!src)
-                continue;
-            int x = k->bitmaps[i].pos.x + src->left - dst->left;
-            int y = k->bitmaps[i].pos.y + src->top  - dst->top;
-            assert(x >= 0 && x + src->w <= dst->w);
-            assert(y >= 0 && y + src->h <= dst->h);
-            unsigned char *buf = dst->buffer + y * dst->stride + x;
-            render_priv->engine.add_bitmaps(buf, dst->stride,
-                                            src->buffer, src->stride,
-                                            src->w, src->h);
-        }
+        combine_bitmaps(render_priv, dst, k->bitmaps, k->bitmap_count, false);
     }
     if (!bord && n_bm_o == 1) {
         ass_copy_bitmap(&render_priv->engine, &v->bm_o, last_o->bm_o);
@@ -2929,19 +2985,7 @@ size_t ass_composite_construct(void *key, void *value, void *priv)
         Bitmap *dst = &v->bm_o;
         dst->left = rect_o.x_min - bord;
         dst->top  = rect_o.y_min - bord;
-        for (int i = 0; i < k->bitmap_count; i++) {
-            Bitmap *src = k->bitmaps[i].bm_o;
-            if (!src)
-                continue;
-            int x = k->bitmaps[i].pos_o.x + src->left - dst->left;
-            int y = k->bitmaps[i].pos_o.y + src->top  - dst->top;
-            assert(x >= 0 && x + src->w <= dst->w);
-            assert(y >= 0 && y + src->h <= dst->h);
-            unsigned char *buf = dst->buffer + y * dst->stride + x;
-            render_priv->engine.add_bitmaps(buf, dst->stride,
-                                            src->buffer, src->stride,
-                                            src->w, src->h);
-        }
+        combine_bitmaps(render_priv, dst, k->bitmaps, k->bitmap_count, true);
     }
 
     int flags = k->filter.flags;
