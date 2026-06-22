@@ -83,6 +83,13 @@ typedef struct ass_image {
     } type;
 
     // New fields can be added here in new ABI-compatible library releases.
+
+    // Deferred-blur mode (ass_set_blur_deferred): the gaussian blur that still
+    // needs to be applied to this image's coverage, as a standard deviation in
+    // bitmap pixels per axis. 0 means no blur is pending (already applied, as
+    // in the default mode). The bitmap bounds (w/h) are already expanded to
+    // hold the blurred result.
+    double blur_x, blur_y;
 } ASS_Image;
 
 /*
@@ -419,6 +426,22 @@ void ass_set_frame_size(ASS_Renderer *priv, int w, int h);
  *       otherwise libass is forced to make a fallible guess.
  */
 void ass_set_storage_size(ASS_Renderer *priv, int w, int h);
+
+/**
+ * \brief Defer gaussian blur to the caller instead of applying it in libass.
+ *
+ * When enabled, rendered ASS_Images carry *unblurred* coverage in bitmap
+ * bounds already expanded to hold the blurred result, plus the gaussian
+ * standard deviation to apply, in the new ASS_Image.blur_x / blur_y fields
+ * (0 when no blur is pending). This lets a GPU-accelerated consumer perform
+ * the (expensive) blur itself. Box blur (\be) is still applied in libass.
+ *
+ * Default: off (libass applies the blur, ASS_Image.blur_x/y are 0).
+ *
+ * \param priv renderer handle
+ * \param deferred 0 to disable (default), non-zero to enable
+ */
+void ass_set_blur_deferred(ASS_Renderer *priv, int deferred);
 
 /**
  * \brief Set shaping level. This is merely a hint, the renderer will use

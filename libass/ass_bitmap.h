@@ -51,6 +51,12 @@ void ass_synth_blur(const BitmapEngine *engine, void *pool, Bitmap *bm,
 
 bool ass_gaussian_blur(const BitmapEngine *engine, void *pool, Bitmap *bm,
                        double r2x, double r2y);
+// Like ass_gaussian_blur, but only expands the bitmap to the bounds the blur
+// would produce (zero-padded, content re-centred) WITHOUT convolving. Used by
+// the deferred-blur mode, where the actual gaussian is applied later (e.g. on
+// the GPU) within these pre-sized bounds.
+bool ass_blur_expand_only(const BitmapEngine *engine, Bitmap *bm,
+                          double r2x, double r2y);
 void ass_shift_bitmap(Bitmap *bm, int shift_x, int shift_y);
 void ass_fix_outline(Bitmap *bm_g, Bitmap *bm_o);
 
