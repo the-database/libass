@@ -387,3 +387,41 @@ bool ass_gaussian_blur(const BitmapEngine *engine, void *pool, Bitmap *bm,
     return true;
 }
 
+bool ass_blur_expand_only(const BitmapEngine *engine, Bitmap *bm,
+                          double r2x, double r2y)
+{
+    if (!bm->buffer)
+        return true;
+
+    BlurMethod blur_x, blur_y;
+    find_best_method(&blur_x, r2x);
+    if (r2y == r2x)
+        memcpy(&blur_y, &blur_x, sizeof(blur_y));
+    else
+        find_best_method(&blur_y, r2y);
+
+    int32_t w = bm->w, h = bm->h;
+    // Same final-size math as ass_gaussian_blur, so the bounds match exactly.
+    int offset_x = ((2 * blur_x.radius + 9) << blur_x.level) - 5;
+    int offset_y = ((2 * blur_y.radius + 9) << blur_y.level) - 5;
+    int32_t end_w = ((w + offset_x) & ~((1 << blur_x.level) - 1)) - 4;
+    int32_t end_h = ((h + offset_y) & ~((1 << blur_y.level) - 1)) - 4;
+    // Where ass_gaussian_blur shifts left/top, i.e. where the original content
+    // lands within the expanded bitmap.
+    int shift_x = ((blur_x.radius + 4) << blur_x.level) - 4;
+    int shift_y = ((blur_y.radius + 4) << blur_y.level) - 4;
+
+    Bitmap dst;
+    if (!ass_alloc_bitmap(engine, &dst, end_w, end_h, true))
+        return false;
+    for (int32_t y = 0; y < h; y++)
+        memcpy(dst.buffer + (intptr_t)(y + shift_y) * dst.stride + shift_x,
+               bm->buffer + (intptr_t) y * bm->stride, w);
+    dst.left = bm->left - shift_x;
+    dst.top  = bm->top  - shift_y;
+
+    ass_aligned_free(bm->buffer);
+    *bm = dst;
+    return true;
+}
+
