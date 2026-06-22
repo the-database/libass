@@ -42,7 +42,7 @@ struct segment {
     int32_t x_min, x_max, y_min, y_max;
 };
 
-typedef struct {
+typedef struct rasterizer_data {
     int outline_error;  // acceptable error (in 1/64 pixel units)
 
     // usable after rasterizer_set_outline
