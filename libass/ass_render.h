@@ -360,6 +360,9 @@ struct ass_renderer {
     // pool == NULL means serial rendering using `state` (the default).
     ASS_ThreadPool *pool;
     RenderContext **worker_ctx;  // length == n_threads
+    RasterizerData *raster_pool; // length == n_threads; per-worker scratch for
+                                 // the nested per-glyph raster (never aliases a
+                                 // worker_ctx rasterizer)
     int n_threads;               // active worker contexts (>= 1 when pool set)
 #endif
 };

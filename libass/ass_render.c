@@ -47,6 +47,14 @@
 #define SUBPIXEL_ORDER 3  // ~ log2(64 / POSITION_PRECISION)
 #define BLUR_PRECISION (1.0 / 256)  // blur error as fraction of full input range
 
+// priv for the bitmap cache construct: the render context plus the rasterizer
+// scratch to use. The rasterizer is passed explicitly (not taken from state) so
+// the per-glyph raster can run on a worker thread with its own scratch while
+// sharing the read-only event state.
+typedef struct {
+    RenderContext *state;
+    RasterizerData *rst;
+} BitmapConstructCtx;
 
 static bool text_info_init(TextInfo* text_info)
 {
@@ -116,6 +124,12 @@ static void destroy_render_pool(ASS_Renderer *priv)
         free(priv->worker_ctx);
         priv->worker_ctx = NULL;
     }
+    if (priv->raster_pool) {
+        for (int i = 0; i < priv->n_threads; i++)
+            ass_rasterizer_done(&priv->raster_pool[i]);
+        free(priv->raster_pool);
+        priv->raster_pool = NULL;
+    }
     priv->n_threads = 0;
 }
 
@@ -167,6 +181,14 @@ void ass_renderer_update_pool(ASS_Renderer *priv)
         destroy_render_pool(priv);  // partial: drop everything, stay serial
         return;
     }
+
+    priv->raster_pool = calloc(n, sizeof(*priv->raster_pool));
+    if (!priv->raster_pool) {
+        destroy_render_pool(priv);
+        return;
+    }
+    for (int i = 0; i < n; i++)
+        ass_rasterizer_init(&priv->engine, &priv->raster_pool[i], RASTERIZER_PRECISION);
 
     priv->pool = ass_thread_pool_create(n);
     if (!priv->pool)
@@ -823,7 +845,8 @@ static void blend_vector_clip(RenderContext *state, ASS_Image *head)
             !quantize_transform(m, &pos, NULL, true, &key))
         return;
 
-    Bitmap *clip_bm = ass_cache_get(render_priv->cache.bitmap_cache, &key, state);
+    Bitmap *clip_bm = ass_cache_get(render_priv->cache.bitmap_cache, &key,
+                                    &(BitmapConstructCtx){ state, &state->rasterizer });
     if (!clip_bm)
         return;
 
@@ -1485,7 +1508,7 @@ static void calc_transform_matrix(RenderContext *state,
  * They are returned in info->bm (glyph), info->bm_o (outline).
  */
 static void
-get_bitmap_glyph(RenderContext *state, GlyphInfo *info,
+get_bitmap_glyph(RenderContext *state, RasterizerData *rst, GlyphInfo *info,
                  int32_t *leftmost_x,
                  ASS_Vector *pos, ASS_Vector *pos_o,
                  ASS_DVector *offset, bool first, int flags)
@@ -1513,7 +1536,8 @@ get_bitmap_glyph(RenderContext *state, GlyphInfo *info,
     if (!quantize_transform(m, pos, offset, first, &key))
         return;
 
-    info->bm = ass_cache_get(render_priv->cache.bitmap_cache, &key, state);
+    info->bm = ass_cache_get(render_priv->cache.bitmap_cache, &key,
+                             &(BitmapConstructCtx){ state, rst });
     if (!info->bm || !info->bm->buffer)
         info->bm = NULL;
 
@@ -1637,7 +1661,8 @@ get_bitmap_glyph(RenderContext *state, GlyphInfo *info,
             !quantize_transform(m, pos_o, offset, false, &key))
         return;
 
-    info->bm_o = ass_cache_get(render_priv->cache.bitmap_cache, &key, state);
+    info->bm_o = ass_cache_get(render_priv->cache.bitmap_cache, &key,
+                               &(BitmapConstructCtx){ state, rst });
     if (!info->bm_o || !info->bm_o->buffer) {
         info->bm_o = NULL;
         *pos_o = *pos;
@@ -1652,7 +1677,8 @@ static inline size_t outline_size(const ASS_Outline* outline)
 
 size_t ass_bitmap_construct(void *key, void *value, void *priv)
 {
-    RenderContext *state = priv;
+    BitmapConstructCtx *ctx = priv;
+    RenderContext *state = ctx->state;
     BitmapHashKey *k = key;
     Bitmap *bm = value;
 
@@ -1668,7 +1694,7 @@ size_t ass_bitmap_construct(void *key, void *value, void *priv)
         ass_outline_transform_2d(&outline[1], &k->outline->outline[1], m);
     }
 
-    if (!ass_outline_to_bitmap(state, bm, &outline[0], &outline[1]))
+    if (!ass_outline_to_bitmap(state, ctx->rst, bm, &outline[0], &outline[1]))
         memset(bm, 0, sizeof(*bm));
     ass_outline_free(&outline[0]);
     ass_outline_free(&outline[1]);
@@ -2574,6 +2600,35 @@ static double restore_blur(int qblur)
 }
 
 // Convert glyphs to bitmaps, combine them, apply blur, generate shadows.
+// A glyph whose raster was deferred out of the serial run-walk (see
+// render_and_combine_glyphs). pos/pos_o are filled in by the raster.
+struct raster_item {
+    GlyphInfo *gi;
+    CombinedBitmapInfo *run;
+    int flags;
+    ASS_DVector offset;
+    ASS_Vector pos, pos_o;
+};
+
+#if CONFIG_THREADS
+struct raster_job {
+    RenderContext *state;
+    struct raster_item *items;
+};
+
+// Rasterize one deferred glyph on a worker thread, using that worker's own
+// rasterizer scratch (worker_id-indexed) and the shared, read-only event state.
+static void raster_task(void *arg, size_t index, size_t worker_id)
+{
+    struct raster_job *j = arg;
+    struct raster_item *it = &j->items[index];
+    RasterizerData *rst = &j->state->renderer->raster_pool[worker_id];
+    int32_t leftmost_x;  // unused: deferred glyphs are never karaoke \kf
+    get_bitmap_glyph(j->state, rst, it->gi, &leftmost_x,
+                     &it->pos, &it->pos_o, &it->offset, false, it->flags);
+}
+#endif
+
 static void render_and_combine_glyphs(RenderContext *state,
                                       double device_x, double device_y)
 {
@@ -2586,6 +2641,14 @@ static void render_and_combine_glyphs(RenderContext *state,
     CombinedBitmapInfo *combined_info = text_info->combined_bitmaps;
     CombinedBitmapInfo *current_info = NULL;
     ASS_DVector offset;
+
+    // Per-glyph rasterization is the hot cost. Within a run the origin `offset`
+    // is set once by the first contributing glyph and read-only afterwards, so
+    // the remaining glyphs are independent and get deferred into this list to be
+    // rasterized in parallel (pass B), then collected in order (pass C).
+    struct raster_item *items = NULL;
+    size_t n_items = 0, max_items = 0;
+
     for (int i = 0; i < text_info->length; i++) {
         GlyphInfo *info = text_info->glyphs + i;
         if (info->starts_new_run) new_run = true;
@@ -2672,8 +2735,28 @@ static void render_and_combine_glyphs(RenderContext *state,
             ASS_Vector pos, pos_o;
             info->pos.x = double_to_d6(device_x + d6_to_double(info->pos.x) * render_priv->par_scale_x);
             info->pos.y = double_to_d6(device_y) + info->pos.y;
-            get_bitmap_glyph(state, info, &current_info->leftmost_x, &pos, &pos_o,
-                             &offset, !current_info->bitmap_count, flags);
+
+            // Origin already established for this (non-karaoke) run -> defer the
+            // raster to pass B. (Karaoke \kf glyphs reduce a shared leftmost_x,
+            // so they must stay serial.)
+            if (current_info->bitmap_count &&
+                current_info->effect_type != EF_KARAOKE_KF) {
+                if (n_items >= max_items) {
+                    size_t ns = max_items ? 2 * max_items : 256;
+                    struct raster_item *ni = realloc(items, ns * sizeof(*ni));
+                    if (!ni)
+                        continue;
+                    items = ni;
+                    max_items = ns;
+                }
+                items[n_items++] = (struct raster_item){
+                    .gi = info, .run = current_info, .flags = flags, .offset = offset,
+                };
+                continue;
+            }
+
+            get_bitmap_glyph(state, &state->rasterizer, info, &current_info->leftmost_x,
+                             &pos, &pos_o, &offset, !current_info->bitmap_count, flags);
 
             if (!info->bm && !info->bm_o)
                 continue;
@@ -2695,6 +2778,44 @@ static void render_and_combine_glyphs(RenderContext *state,
             current_info->y = FFMIN(current_info->y, pos.y);
         }
     }
+
+    // Pass B: rasterize the deferred glyphs, in parallel across the worker pool
+    // (each uses its own rasterizer scratch). The cache is thread-safe and the
+    // event state is read-only here, so this is a plain non-exclusive fan-out.
+#if CONFIG_THREADS
+    if (render_priv->pool && n_items > 1) {
+        struct raster_job job = { state, items };
+        ass_thread_pool_run(render_priv->pool, n_items, raster_task, &job, false);
+    } else
+#endif
+    for (size_t k = 0; k < n_items; k++) {
+        int32_t leftmost_x;
+        get_bitmap_glyph(state, &state->rasterizer, items[k].gi, &leftmost_x,
+                         &items[k].pos, &items[k].pos_o, &items[k].offset, false,
+                         items[k].flags);
+    }
+
+    // Pass C: collect the deferred glyphs into their runs, in original order.
+    for (size_t k = 0; k < n_items; k++) {
+        GlyphInfo *gi = items[k].gi;
+        CombinedBitmapInfo *ci = items[k].run;
+        if (!gi->bm && !gi->bm_o)
+            continue;
+        if (ci->bitmap_count >= ci->max_bitmap_count) {
+            size_t new_size = 2 * ci->max_bitmap_count;
+            if (!ASS_REALLOC_ARRAY(ci->bitmaps, new_size))
+                continue;
+            ci->max_bitmap_count = new_size;
+        }
+        ci->bitmaps[ci->bitmap_count].bm   = gi->bm;
+        ci->bitmaps[ci->bitmap_count].bm_o = gi->bm_o;
+        ci->bitmaps[ci->bitmap_count].pos   = items[k].pos;
+        ci->bitmaps[ci->bitmap_count].pos_o = items[k].pos_o;
+        ci->bitmap_count++;
+        ci->x = FFMIN(ci->x, items[k].pos.x);
+        ci->y = FFMIN(ci->y, items[k].pos.y);
+    }
+    free(items);
 
     for (int i = 0; i < nb_bitmaps; i++) {
         CombinedBitmapInfo *info = &combined_info[i];

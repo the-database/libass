@@ -27,6 +27,9 @@
 #include "ass_outline.h"
 #include "ass_bitmap_engine.h"
 
+struct render_context;
+struct rasterizer_data;
+
 typedef struct {
     int32_t left, top;
     int32_t w, h;         // width, height
@@ -41,7 +44,7 @@ void ass_free_bitmap(Bitmap *bm);
 
 struct render_context;
 
-bool ass_outline_to_bitmap(struct render_context *state, Bitmap *bm,
+bool ass_outline_to_bitmap(struct render_context *state, struct rasterizer_data *rst, Bitmap *bm,
                            ASS_Outline *outline1, ASS_Outline *outline2);
 
 // pool (an ASS_ThreadPool *, or NULL) lets a large gaussian blur farm its
