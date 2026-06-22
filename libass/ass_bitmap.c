@@ -146,11 +146,10 @@ bool ass_copy_bitmap(const BitmapEngine *engine, Bitmap *dst, const Bitmap *src)
     return true;
 }
 
-bool ass_outline_to_bitmap(RenderContext *state, Bitmap *bm,
+bool ass_outline_to_bitmap(RenderContext *state, RasterizerData *rst, Bitmap *bm,
                            ASS_Outline *outline1, ASS_Outline *outline2)
 {
     ASS_Renderer *render_priv = state->renderer;
-    RasterizerData *rst = &state->rasterizer;
     if (outline1 && !ass_rasterizer_set_outline(rst, outline1, false)) {
         ass_msg(render_priv->library, MSGL_WARN, "Failed to process glyph outline!\n");
         return false;
