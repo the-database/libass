@@ -301,7 +301,7 @@ void ass_renderer_done(ASS_Renderer *render_priv)
  */
 static ASS_Image *my_draw_bitmap(unsigned char *bitmap, int bitmap_w,
                                  int bitmap_h, int stride, int dst_x,
-                                 int dst_y, uint32_t color,
+                                 int dst_y, uint32_t color, unsigned type,
                                  CompositeHashValue *source)
 {
     ASS_ImagePriv *img = malloc(sizeof(ASS_ImagePriv));
@@ -318,6 +318,16 @@ static ASS_Image *my_draw_bitmap(unsigned char *bitmap, int bitmap_w,
     img->result.color = color;
     img->result.dst_x = dst_x;
     img->result.dst_y = dst_y;
+    img->result.type = type;
+    // Deferred blur applies to outline/shadow always, but to the fill only when
+    // libass actually blurred it (it doesn't, for a non-zero border).
+    if (source && !(type == IMAGE_TYPE_CHARACTER && !source->fill_blurred)) {
+        img->result.blur_x = source->blur_x;
+        img->result.blur_y = source->blur_y;
+    } else {
+        img->result.blur_x = 0.0;
+        img->result.blur_y = 0.0;
+    }
 
     img->source = source;
     ass_cache_inc_ref(source);
@@ -480,9 +490,8 @@ static ASS_Image **render_glyph_i(RenderContext *state,
             if (lbrk > r[j].x1) lbrk = r[j].x1;
             img = my_draw_bitmap(bm->buffer + r[j].y0 * bm->stride + r[j].x0,
                                  lbrk - r[j].x0, r[j].y1 - r[j].y0, bm->stride,
-                                 dst_x + r[j].x0, dst_y + r[j].y0, color, source);
+                                 dst_x + r[j].x0, dst_y + r[j].y0, color, type, source);
             if (!img) break;
-            img->type = type;
             *tail = img;
             tail = &img->next;
         }
@@ -490,9 +499,8 @@ static ASS_Image **render_glyph_i(RenderContext *state,
             if (lbrk < r[j].x0) lbrk = r[j].x0;
             img = my_draw_bitmap(bm->buffer + r[j].y0 * bm->stride + lbrk,
                                  r[j].x1 - lbrk, r[j].y1 - r[j].y0, bm->stride,
-                                 dst_x + lbrk, dst_y + r[j].y0, color2, source);
+                                 dst_x + lbrk, dst_y + r[j].y0, color2, type, source);
             if (!img) break;
-            img->type = type;
             *tail = img;
             tail = &img->next;
         }
@@ -567,9 +575,8 @@ render_glyph(RenderContext *state, Bitmap *bm, int dst_x, int dst_y,
             brk = b_x1;
         img = my_draw_bitmap(bm->buffer + bm->stride * b_y0 + b_x0,
                              brk - b_x0, b_y1 - b_y0, bm->stride,
-                             dst_x + b_x0, dst_y + b_y0, color, source);
+                             dst_x + b_x0, dst_y + b_y0, color, type, source);
         if (!img) return tail;
-        img->type = type;
         *tail = img;
         tail = &img->next;
     }
@@ -578,9 +585,8 @@ render_glyph(RenderContext *state, Bitmap *bm, int dst_x, int dst_y,
             brk = b_x0;
         img = my_draw_bitmap(bm->buffer + bm->stride * b_y0 + brk,
                              b_x1 - brk, b_y1 - b_y0, bm->stride,
-                             dst_x + brk, dst_y + b_y0, color2, source);
+                             dst_x + brk, dst_y + b_y0, color2, type, source);
         if (!img) return tail;
-        img->type = type;
         *tail = img;
         tail = &img->next;
     }
@@ -2825,9 +2831,25 @@ size_t ass_composite_construct(void *key, void *value, void *priv)
 #else
     void *blur_pool = NULL;
 #endif
-    if (!(flags & FILTER_NONZERO_BORDER) || (flags & FILTER_BORDER_STYLE_3))
-        ass_synth_blur(&render_priv->engine, blur_pool, &v->bm, k->filter.be, r2x, r2y);
-    ass_synth_blur(&render_priv->engine, blur_pool, &v->bm_o, k->filter.be, r2x, r2y);
+    bool blur_bm = !(flags & FILTER_NONZERO_BORDER) || (flags & FILTER_BORDER_STYLE_3);
+    if (render_priv->blur_deferred) {
+        // Don't convolve: just expand the bitmaps to the bounds the blur would
+        // produce, and record the gaussian std-dev so a downstream consumer
+        // (e.g. the GPU) can apply it. NOTE (spike): box blur (\be) is not
+        // deferred; gaussian \blur only.
+        if (r2x > 0.001 || r2y > 0.001) {
+            if (blur_bm)
+                ass_blur_expand_only(&render_priv->engine, &v->bm, r2x, r2y);
+            ass_blur_expand_only(&render_priv->engine, &v->bm_o, r2x, r2y);
+        }
+        v->blur_x = r2x > 0.001 ? sqrt(r2x) : 0.0;
+        v->blur_y = r2y > 0.001 ? sqrt(r2y) : 0.0;
+        v->fill_blurred = blur_bm;
+    } else {
+        if (blur_bm)
+            ass_synth_blur(&render_priv->engine, blur_pool, &v->bm, k->filter.be, r2x, r2y);
+        ass_synth_blur(&render_priv->engine, blur_pool, &v->bm_o, k->filter.be, r2x, r2y);
+    }
 
     if (!(flags & FILTER_FILL_IN_BORDER) && !(flags & FILTER_FILL_IN_SHADOW))
         ass_fix_outline(&v->bm, &v->bm_o);
@@ -2885,7 +2907,7 @@ static void add_background(RenderContext *state, EventImages *event_images)
     uint32_t clr = state->c[3];
     ass_apply_fade(&clr, state->fade);
     ASS_Image *img = my_draw_bitmap(nbuffer, w, h, w, left, top,
-                                    clr, NULL);
+                                    clr, IMAGE_TYPE_CHARACTER, NULL);
     if (img) {
         img->next = event_images->imgs;
         event_images->imgs = img;

@@ -76,6 +76,17 @@ void ass_set_storage_size(ASS_Renderer *priv, int w, int h)
     }
 }
 
+void ass_set_blur_deferred(ASS_Renderer *priv, int deferred)
+{
+    deferred = !!deferred;
+    if (priv->blur_deferred != deferred) {
+        priv->blur_deferred = deferred;
+        // The composite cache holds (un)blurred bitmaps keyed without regard to
+        // this mode, so it must be dropped when the mode changes.
+        ass_cache_empty(priv->cache.composite_cache);
+    }
+}
+
 void ass_set_shaper(ASS_Renderer *priv, ASS_ShapingLevel level)
 {
     // select the complex shaper for illegal values

@@ -324,6 +324,7 @@ struct ass_renderer {
     size_t num_emfonts;
     ASS_Settings settings;
     int render_id;
+    bool blur_deferred;         // emit unblurred coverage + ASS_Image.blur_x/y
 
     ASS_Image *images_root;     // rendering result is stored here
     ASS_Image *prev_images_root;
