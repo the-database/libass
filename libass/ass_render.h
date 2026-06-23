@@ -124,6 +124,7 @@ typedef struct {
     int x, y;
     Bitmap *bm, *bm_o, *bm_s;   // glyphs, outline, shadow bitmaps
     CompositeHashValue *image;
+    bool deferred;              // composite-deferred: emit per-glyph, no combine
 } CombinedBitmapInfo;
 
 typedef struct {
