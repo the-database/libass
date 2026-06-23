@@ -408,9 +408,7 @@ static ASS_Image *my_draw_glyph(Bitmap *bm, int dst_x, int dst_y,
     img->result.type = type;
     img->result.blur_x = blur_x;
     img->result.blur_y = blur_y;
-    // Stage A: per-frame upload, so glyph_id need only be a stable handle for
-    // run pairing; the cache value pointer serves (real hash comes with Stage B).
-    img->result.glyph_id = (uint64_t)(uintptr_t) bm;
+    img->result.glyph_id = bm->cache_id;   // stable per cached glyph (Stage B cache)
     img->result.run_id = run_id;
     img->result.run_flags = run_flags;
     img->source = (CompositeHashValue *) bm;
@@ -1806,6 +1804,11 @@ size_t ass_bitmap_construct(void *key, void *value, void *priv)
         memset(bm, 0, sizeof(*bm));
     ass_outline_free(&outline[0]);
     ass_outline_free(&outline[1]);
+
+    // Stable, collision-free id for the deferred-composite GPU glyph cache: a
+    // new cache entry gets a fresh id, a reused one keeps it (motion-invariant).
+    static ass_atomic_size_t bitmap_id_counter;
+    bm->cache_id = ass_atomic_inc_size(&bitmap_id_counter);
 
     return sizeof(BitmapHashKey) + sizeof(Bitmap) + bitmap_size(bm) +
            sizeof(OutlineHashValue) + outline_size(&k->outline->outline[0]) + outline_size(&k->outline->outline[1]);

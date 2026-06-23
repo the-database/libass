@@ -35,6 +35,7 @@ typedef struct {
     int32_t w, h;         // width, height
     ptrdiff_t stride;
     uint8_t *buffer;      // h * stride buffer
+    uint64_t cache_id;    // unique per cached glyph bitmap (deferred-composite id)
 } Bitmap;
 
 bool ass_alloc_bitmap(const BitmapEngine *engine, Bitmap *bm, int32_t w, int32_t h, bool zero);
