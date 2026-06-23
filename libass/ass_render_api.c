@@ -87,6 +87,17 @@ void ass_set_blur_deferred(ASS_Renderer *priv, int deferred)
     }
 }
 
+void ass_set_composite_deferred(ASS_Renderer *priv, int deferred)
+{
+    deferred = !!deferred;
+    if (priv->composite_deferred != deferred) {
+        priv->composite_deferred = deferred;
+        // Glyphs are emitted uncombined in this mode, so the composite cache
+        // (which holds combined run bitmaps) must be dropped on a mode change.
+        ass_cache_empty(priv->cache.composite_cache);
+    }
+}
+
 void ass_set_shaper(ASS_Renderer *priv, ASS_ShapingLevel level)
 {
     // select the complex shaper for illegal values
