@@ -435,6 +435,12 @@ static ASS_Image **render_run_deferred(CombinedBitmapInfo *info, bool outline,
     double by = restore_blur(info->filter.blur_y);
     bx = bx > 0.001 ? sqrt(bx) : 0.0;
     by = by > 0.001 ? sqrt(by) : 0.0;
+    // The fill is only blurred when there's no (nonzero) border, matching
+    // ass_composite_construct's blur_bm; the border is always blurred.
+    bool blur_fill = !(info->filter.flags & FILTER_NONZERO_BORDER) ||
+                     (info->filter.flags & FILTER_BORDER_STYLE_3);
+    if (!outline && !blur_fill)
+        bx = by = 0.0;
     for (size_t j = 0; j < info->bitmap_count; j++) {
         BitmapRef *ref = &info->bitmaps[j];
         Bitmap *bm = outline ? ref->bm_o : ref->bm;
