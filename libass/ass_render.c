@@ -425,7 +425,10 @@ static ASS_Image *my_draw_glyph(Bitmap *bm, int dst_x, int dst_y,
 static ASS_Image **render_run_deferred(CombinedBitmapInfo *info, bool outline,
                                        uint32_t run_id, ASS_Image **tail)
 {
-    uint32_t flags = info->filter.flags;
+    // Clean run_flags ABI for the GPU consumer: bit 0 = apply fix_outline
+    // (subtract fill from border), matching ass_composite_construct's gate.
+    // Deferred runs never carry a shadow, so only FILL_IN_BORDER matters.
+    uint32_t flags = (info->filter.flags & FILTER_FILL_IN_BORDER) ? 0 : 1;
     uint32_t color = outline ? info->c[2] : info->c[0];
     unsigned type = outline ? IMAGE_TYPE_OUTLINE : IMAGE_TYPE_CHARACTER;
     double bx = restore_blur(info->filter.blur_x);
