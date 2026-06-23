@@ -80,5 +80,9 @@ bool ass_rasterizer_fill(const BitmapEngine *engine, RasterizerData *rst,
                          uint8_t *buf, int x0, int y0,
                          int width, int height, ptrdiff_t stride);
 
+// Flatten outline(s) to line-segment endpoints for a GPU rasterizer (see .c).
+int ass_outline_to_segments(const ASS_Outline *o0, const ASS_Outline *o1, int outline_error,
+                            int32_t **out, int32_t *left, int32_t *top, int32_t *w, int32_t *h);
+
 
 #endif /* LIBASS_RASTERIZER_H */

@@ -411,6 +411,8 @@ static ASS_Image *my_draw_glyph(Bitmap *bm, int dst_x, int dst_y,
     img->result.glyph_id = bm->cache_id;   // stable per cached glyph (Stage B cache)
     img->result.run_id = run_id;
     img->result.run_flags = run_flags;
+    img->result.outline = bm->segments;    // outline-deferred: GPU rasterizes these
+    img->result.n_outline = bm->n_segments;
     img->source = (CompositeHashValue *) bm;
     ass_cache_inc_ref(bm);
     img->buffer = NULL;
@@ -442,7 +444,7 @@ static ASS_Image **render_run_deferred(CombinedBitmapInfo *info, bool outline,
     for (size_t j = 0; j < info->bitmap_count; j++) {
         BitmapRef *ref = &info->bitmaps[j];
         Bitmap *bm = outline ? ref->bm_o : ref->bm;
-        if (!bm || !bm->buffer)
+        if (!bm || (!bm->buffer && !bm->n_segments))
             continue;
         ASS_Vector pos = outline ? ref->pos_o : ref->pos;
         ASS_Image *im = my_draw_glyph(bm, info->x + pos.x, info->y + pos.y,
@@ -1051,10 +1053,17 @@ static ASS_Image *render_text(RenderContext *state)
                          1000000, tail, IMAGE_TYPE_SHADOW, info->image);
     }
 
+    // Run ids must be unique across the whole frame, not just this event, or
+    // mpv's compositor would merge same-index runs from different events into
+    // one region. Reserve a frame-wide block for this event's n_bitmaps runs
+    // (atomic: events may render in parallel).
+    uint32_t run_base = ass_atomic_add_uint(&state->renderer->deferred_run_base,
+                                            n_bitmaps);
+
     for (unsigned i = 0; i < n_bitmaps; i++) {
         CombinedBitmapInfo *info = &bitmaps[i];
         if (info->deferred) {
-            tail = render_run_deferred(info, true, i + 1, tail);
+            tail = render_run_deferred(info, true, run_base + i + 1, tail);
             continue;
         }
         if (!info->bm_o)
@@ -1073,7 +1082,7 @@ static ASS_Image *render_text(RenderContext *state)
     for (unsigned i = 0; i < n_bitmaps; i++) {
         CombinedBitmapInfo *info = &bitmaps[i];
         if (info->deferred) {
-            tail = render_run_deferred(info, false, i + 1, tail);
+            tail = render_run_deferred(info, false, run_base + i + 1, tail);
             free(info->bitmaps);    // owned by us in deferred mode (no combine)
             info->bitmaps = NULL;
             continue;
@@ -1644,7 +1653,7 @@ get_bitmap_glyph(RenderContext *state, RasterizerData *rst, GlyphInfo *info,
 
     info->bm = ass_cache_get(render_priv->cache.bitmap_cache, &key,
                              &(BitmapConstructCtx){ state, rst });
-    if (!info->bm || !info->bm->buffer)
+    if (!info->bm || (!info->bm->buffer && !info->bm->n_segments))
         info->bm = NULL;
 
     *pos_o = *pos;
@@ -1769,7 +1778,7 @@ get_bitmap_glyph(RenderContext *state, RasterizerData *rst, GlyphInfo *info,
 
     info->bm_o = ass_cache_get(render_priv->cache.bitmap_cache, &key,
                                &(BitmapConstructCtx){ state, rst });
-    if (!info->bm_o || !info->bm_o->buffer) {
+    if (!info->bm_o || (!info->bm_o->buffer && !info->bm_o->n_segments)) {
         info->bm_o = NULL;
         *pos_o = *pos;
     } else if (!info->bm)
@@ -1800,8 +1809,18 @@ size_t ass_bitmap_construct(void *key, void *value, void *priv)
         ass_outline_transform_2d(&outline[1], &k->outline->outline[1], m);
     }
 
-    if (!ass_outline_to_bitmap(state, ctx->rst, bm, &outline[0], &outline[1]))
+    if (state->renderer->outline_deferred) {
+        // GPU-rasterizer mode: emit the transformed outline as line segments
+        // instead of rasterizing on the CPU.
         memset(bm, 0, sizeof(*bm));
+        int32_t left, top, w, h;
+        bm->n_segments = ass_outline_to_segments(&outline[0], &outline[1],
+                                                 RASTERIZER_PRECISION, &bm->segments,
+                                                 &left, &top, &w, &h);
+        bm->left = left; bm->top = top; bm->w = w; bm->h = h;
+    } else if (!ass_outline_to_bitmap(state, ctx->rst, bm, &outline[0], &outline[1])) {
+        memset(bm, 0, sizeof(*bm));
+    }
     ass_outline_free(&outline[0]);
     ass_outline_free(&outline[1]);
 
@@ -3892,6 +3911,8 @@ ASS_Image *ass_render_frame(ASS_Renderer *priv, ASS_Track *track,
             *detect_change = 2;
         return NULL;
     }
+
+    ass_atomic_store_uint(&priv->deferred_run_base, 0);  // frame-unique run ids
 
     // render events separately
     int cnt = 0;

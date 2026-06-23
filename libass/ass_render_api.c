@@ -98,6 +98,17 @@ void ass_set_composite_deferred(ASS_Renderer *priv, int deferred)
     }
 }
 
+void ass_set_outline_deferred(ASS_Renderer *priv, int deferred)
+{
+    deferred = !!deferred;
+    if (priv->outline_deferred != deferred) {
+        priv->outline_deferred = deferred;
+        // The bitmap cache holds rasterized coverage in the normal mode and
+        // outline segments in this one; drop it on a mode change.
+        ass_cache_empty(priv->cache.bitmap_cache);
+    }
+}
+
 void ass_set_shaper(ASS_Renderer *priv, ASS_ShapingLevel level)
 {
     // select the complex shaper for illegal values

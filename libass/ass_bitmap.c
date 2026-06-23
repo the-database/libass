@@ -130,6 +130,7 @@ bool ass_realloc_bitmap(const BitmapEngine *engine, Bitmap *bm, int32_t w, int32
 void ass_free_bitmap(Bitmap *bm)
 {
     ass_aligned_free(bm->buffer);
+    free(bm->segments);   // outline-deferred mode (NULL otherwise)
 }
 
 bool ass_copy_bitmap(const BitmapEngine *engine, Bitmap *dst, const Bitmap *src)

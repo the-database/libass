@@ -328,6 +328,8 @@ struct ass_renderer {
     int render_id;
     bool blur_deferred;         // emit unblurred coverage + ASS_Image.blur_x/y
     bool composite_deferred;    // emit uncombined per-glyph images (implies blur_deferred)
+    bool outline_deferred;      // emit glyph outline segments, not bitmaps (implies composite_deferred)
+    ass_atomic_uint_t deferred_run_base; // frame-wide run_id allocator (composite_deferred)
 
     ASS_Image *images_root;     // rendering result is stored here
     ASS_Image *prev_images_root;
