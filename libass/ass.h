@@ -105,6 +105,14 @@ typedef struct ass_image {
     uint64_t glyph_id;
     uint32_t run_id;
     uint32_t run_flags;
+
+    // Deferred-outline mode (ass_set_outline_deferred): instead of a rasterized
+    // coverage bitmap (bitmap == NULL), this image carries the glyph's flattened,
+    // transformed coverage outline for a GPU rasterizer. `outline` points to
+    // n_outline*4 int32 values (x0,y0,x1,y1 per line segment) in 1/64 px,
+    // relative to (dst_x, dst_y). w/h is the coverage bounding box.
+    int32_t *outline;
+    int32_t n_outline;
 } ASS_Image;
 
 /*
@@ -479,6 +487,21 @@ void ass_set_blur_deferred(ASS_Renderer *priv, int deferred);
  * \param deferred 0 to disable (default), non-zero to enable
  */
 void ass_set_composite_deferred(ASS_Renderer *priv, int deferred);
+
+/**
+ * \brief Emit glyph outlines as line segments for a GPU rasterizer, instead of
+ * rasterizing them on the CPU. Implies (and forces) deferred composite. In this
+ * mode ASS_Image.bitmap is NULL and ASS_Image.outline carries the glyph's
+ * flattened, transformed coverage outline (n_outline line segments, 4 int32
+ * each: x0,y0,x1,y1 in 1/64 px, relative to dst_x,dst_y). The downstream
+ * consumer rasterizes the coverage on the GPU, then combines/blurs/composites
+ * it. This moves the per-frame glyph rasterization off the CPU entirely.
+ *
+ * Default: off.
+ * \param priv renderer handle
+ * \param deferred 0 to disable (default), non-zero to enable
+ */
+void ass_set_outline_deferred(ASS_Renderer *priv, int deferred);
 
 /**
  * \brief Set shaping level. This is merely a hint, the renderer will use

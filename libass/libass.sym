@@ -52,3 +52,4 @@ ass_set_render_thread_count
 ass_get_render_thread_count
 ass_set_blur_deferred
 ass_set_composite_deferred
+ass_set_outline_deferred

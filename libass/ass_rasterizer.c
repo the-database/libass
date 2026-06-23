@@ -262,6 +262,102 @@ static bool add_cubic(RasterizerData *rst, const ASS_Vector *pt)
 }
 
 
+// --- Outline -> line-segment endpoints (for a GPU rasterizer) ---------------
+// Same tessellation as set_outline (segment_subdivide + quad/cubic midpoint
+// subdivision), but emits line endpoints instead of halfplane segments.
+struct seg_emit {
+    int32_t *buf; int n, max;
+    int32_t minx, miny, maxx, maxy;
+    int err;
+    bool ok;
+};
+
+static void se_line(struct seg_emit *e, ASS_Vector a, ASS_Vector b)
+{
+    if ((a.x == b.x && a.y == b.y) || !e->ok)
+        return;
+    if (e->n * 4 + 4 > e->max) {
+        int nm = e->max ? e->max * 2 : 256;
+        int32_t *nb = realloc(e->buf, nm * sizeof(int32_t));
+        if (!nb) { e->ok = false; return; }
+        e->buf = nb; e->max = nm;
+    }
+    int32_t *p = e->buf + e->n * 4;
+    p[0] = a.x; p[1] = a.y; p[2] = b.x; p[3] = b.y;
+    e->n++;
+    if (a.x < e->minx) e->minx = a.x; if (a.x > e->maxx) e->maxx = a.x;
+    if (b.x < e->minx) e->minx = b.x; if (b.x > e->maxx) e->maxx = b.x;
+    if (a.y < e->miny) e->miny = a.y; if (a.y > e->maxy) e->maxy = a.y;
+    if (b.y < e->miny) e->miny = b.y; if (b.y > e->maxy) e->maxy = b.y;
+}
+
+static void se_quad(struct seg_emit *e, const ASS_Vector *pt)
+{
+    OutlineSegment seg;
+    segment_init(&seg, pt[0], pt[2], e->err);
+    if (!segment_subdivide(&seg, pt[0], pt[1])) { se_line(e, pt[0], pt[2]); return; }
+    ASS_Vector n[5];
+    n[1].x = pt[0].x + pt[1].x; n[1].y = pt[0].y + pt[1].y;
+    n[3].x = pt[1].x + pt[2].x; n[3].y = pt[1].y + pt[2].y;
+    n[2].x = (n[1].x + n[3].x + 2) >> 2; n[2].y = (n[1].y + n[3].y + 2) >> 2;
+    n[1].x >>= 1; n[1].y >>= 1; n[3].x >>= 1; n[3].y >>= 1; n[0] = pt[0]; n[4] = pt[2];
+    se_quad(e, n); se_quad(e, n + 2);
+}
+
+static void se_cubic(struct seg_emit *e, const ASS_Vector *pt)
+{
+    OutlineSegment seg;
+    segment_init(&seg, pt[0], pt[3], e->err);
+    if (!segment_subdivide(&seg, pt[0], pt[1]) && !segment_subdivide(&seg, pt[0], pt[2])) {
+        se_line(e, pt[0], pt[3]); return;
+    }
+    ASS_Vector n[7], c;
+    n[1].x = pt[0].x + pt[1].x; n[1].y = pt[0].y + pt[1].y;
+    c.x = pt[1].x + pt[2].x + 2; c.y = pt[1].y + pt[2].y + 2;
+    n[5].x = pt[2].x + pt[3].x; n[5].y = pt[2].y + pt[3].y;
+    n[2].x = n[1].x + c.x; n[2].y = n[1].y + c.y; n[4].x = c.x + n[5].x; n[4].y = c.y + n[5].y;
+    n[3].x = (n[2].x + n[4].x - 1) >> 3; n[3].y = (n[2].y + n[4].y - 1) >> 3;
+    n[2].x >>= 2; n[2].y >>= 2; n[4].x >>= 2; n[4].y >>= 2;
+    n[1].x >>= 1; n[1].y >>= 1; n[5].x >>= 1; n[5].y >>= 1; n[0] = pt[0]; n[6] = pt[3];
+    se_cubic(e, n); se_cubic(e, n + 3);
+}
+
+static void se_walk(struct seg_emit *e, const ASS_Outline *ol)
+{
+    if (!ol || !ol->n_points)
+        return;
+    ASS_Vector *start = ol->points, *cur = start, p[4];
+    for (size_t i = 0; i < ol->n_segments; i++) {
+        int n = ol->segments[i] & OUTLINE_COUNT_MASK; cur += n;
+        ASS_Vector *end = cur;
+        if (ol->segments[i] & OUTLINE_CONTOUR_END) { end = start; start = cur; }
+        if (n == 1) se_line(e, cur[-1], *end);
+        else if (n == 2) { p[0] = cur[-2]; p[1] = cur[-1]; p[2] = *end; se_quad(e, p); }
+        else { p[0] = cur[-3]; p[1] = cur[-2]; p[2] = cur[-1]; p[3] = *end; se_cubic(e, p); }
+    }
+}
+
+// Flatten outline0 (+optional outline1) to line endpoints in 1/64px, rebased to
+// the coverage bbox origin. Returns segment count; *out is malloc'd (caller frees).
+// left/top/w/h match ass_outline_to_bitmap's pixel bounds.
+int ass_outline_to_segments(const ASS_Outline *o0, const ASS_Outline *o1, int outline_error,
+                            int32_t **out, int32_t *left, int32_t *top, int32_t *w, int32_t *h)
+{
+    struct seg_emit e = { NULL, 0, 0, INT32_MAX, INT32_MAX, INT32_MIN, INT32_MIN,
+                          outline_error, true };
+    se_walk(&e, o0);
+    se_walk(&e, o1);
+    if (!e.ok || !e.n || e.minx > e.maxx) { free(e.buf); *out = NULL; return 0; }
+    int32_t lx = (e.minx - 1) >> 6, ty = (e.miny - 1) >> 6;
+    int32_t rx = (e.maxx + 127) >> 6, by = (e.maxy + 127) >> 6;
+    int32_t ox = lx << 6, oy = ty << 6;
+    for (int i = 0; i < e.n; i++) {
+        e.buf[i*4+0] -= ox; e.buf[i*4+1] -= oy; e.buf[i*4+2] -= ox; e.buf[i*4+3] -= oy;
+    }
+    *left = lx; *top = ty; *w = rx - lx; *h = by - ty; *out = e.buf;
+    return e.n;
+}
+
 bool ass_rasterizer_set_outline(RasterizerData *rst,
                                 const ASS_Outline *path, bool extra)
 {
