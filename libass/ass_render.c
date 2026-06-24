@@ -1159,8 +1159,8 @@ static ASS_Image *render_text(RenderContext *state)
 
     *tail = 0;
     // Vector \clip multiplies each image's CPU coverage; outline-deferred images
-    // have none (segments only), so skip it (clip not applied -- a known
-    // limitation, to be moved to the GPU).
+    // have none (segments only), so skip it (clip not applied -- needs a GPU
+    // clip-mask multiply, not yet implemented).
     if (!state->renderer->outline_deferred)
         blend_vector_clip(state, head);
 
@@ -3022,7 +3022,9 @@ static void render_and_combine_glyphs(RenderContext *state,
         // the GPU consumer combines them. Shadow/karaoke runs fall back here.
         // In outline-deferred mode the per-glyph bitmaps carry no CPU coverage
         // (segments only), so the CPU composite path below would crash -- force
-        // every run deferred (shadow/karaoke/clip effects are not yet applied).
+        // every run deferred. (Vector \clip can't fall back to the CPU here: the
+        // renderer is globally in segment mode, so combine_bitmaps would read NULL
+        // -- clip needs a GPU clip-mask multiply instead, not yet implemented.)
         if (render_priv->outline_deferred ||
             (deferrable && info->effect_type == EF_NONE &&
              !(info->filter.flags & FILTER_NONZERO_SHADOW))) {
