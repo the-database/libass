@@ -2972,10 +2972,15 @@ static void render_and_combine_glyphs(RenderContext *state,
         // Composite-deferred runs (no shadow, no karaoke) skip the CPU combine
         // and keep their per-glyph bitmaps for per-glyph emission in render_text;
         // the GPU consumer combines them. Shadow/karaoke runs fall back here.
-        if (deferrable && info->effect_type == EF_NONE &&
-            !(info->filter.flags & FILTER_NONZERO_SHADOW)) {
+        // In outline-deferred mode the per-glyph bitmaps carry no CPU coverage
+        // (segments only), so the CPU composite path below would crash -- force
+        // every run deferred (shadow/karaoke/clip effects are not yet applied).
+        if (render_priv->outline_deferred ||
+            (deferrable && info->effect_type == EF_NONE &&
+             !(info->filter.flags & FILTER_NONZERO_SHADOW))) {
             info->deferred = true;
-            continue;
+            info->bm = info->bm_o = info->bm_s = NULL;  // deferred path uses info->bitmaps;
+            continue;                                   // keep the shadow pass from reading these
         }
 
         CompositeHashKey key;
