@@ -394,12 +394,18 @@ static ASS_Image *my_draw_glyph(Bitmap *bm, int dst_x, int dst_y,
                                 uint32_t color, unsigned type,
                                 double blur_x, double blur_y,
                                 uint32_t run_id, uint32_t run_flags,
-                                uint32_t clip_id)
+                                uint32_t clip_id,
+                                int32_t rcx0, int32_t rcy0,
+                                int32_t rcx1, int32_t rcy1)
 {
     ASS_ImagePriv *img = malloc(sizeof(ASS_ImagePriv));
     if (!img)
         return NULL;
     img->result.clip_id = clip_id;
+    img->result.clip_rx0 = rcx0;
+    img->result.clip_ry0 = rcy0;
+    img->result.clip_rx1 = rcx1;
+    img->result.clip_ry1 = rcy1;
     img->result.w = bm->w;
     img->result.h = bm->h;
     img->result.stride = bm->stride;
@@ -431,6 +437,8 @@ static ASS_Image *my_draw_glyph(Bitmap *bm, int dst_x, int dst_y,
 
 static ASS_Image **render_run_deferred(CombinedBitmapInfo *info, bool outline,
                                        uint32_t run_id, uint32_t clip_id,
+                                       int32_t rcx0, int32_t rcy0,
+                                       int32_t rcx1, int32_t rcy1,
                                        ASS_Image **tail)
 {
     // Clean run_flags ABI for the GPU consumer: bit 0 = apply fix_outline
@@ -456,7 +464,8 @@ static ASS_Image **render_run_deferred(CombinedBitmapInfo *info, bool outline,
             continue;
         ASS_Vector pos = outline ? ref->pos_o : ref->pos;
         ASS_Image *im = my_draw_glyph(bm, info->x + pos.x, info->y + pos.y,
-                                      color, type, bx, by, run_id, flags, clip_id);
+                                      color, type, bx, by, run_id, flags, clip_id,
+                                      rcx0, rcy0, rcx1, rcy1);
         if (im) {
             *tail = im;
             tail = &im->next;
@@ -470,7 +479,10 @@ static ASS_Image **render_run_deferred(CombinedBitmapInfo *info, bool outline,
 // Emitted before the fill/border runs so it composites behind them. Sub-pixel
 // shadow offset is rounded to whole px (shadows are soft -- visually identical).
 static ASS_Image **render_shadow_deferred(CombinedBitmapInfo *info, uint32_t run_id,
-                                          uint32_t clip_id, ASS_Image **tail)
+                                          uint32_t clip_id,
+                                          int32_t rcx0, int32_t rcy0,
+                                          int32_t rcx1, int32_t rcy1,
+                                          ASS_Image **tail)
 {
     uint32_t color = info->c[3];
     int sx = lround(info->filter.shadow.x / 64.0);
@@ -491,7 +503,7 @@ static ASS_Image **render_shadow_deferred(CombinedBitmapInfo *info, uint32_t run
             ASS_Vector pos = o ? ref->pos_o : ref->pos;
             ASS_Image *im = my_draw_glyph(bm, info->x + pos.x + sx, info->y + pos.y + sy,
                                           color, IMAGE_TYPE_CHARACTER, bx, by, run_id, 1,
-                                          clip_id);
+                                          clip_id, rcx0, rcy0, rcx1, rcy1);
             if (im) {
                 *tail = im;
                 tail = &im->next;
@@ -1114,7 +1126,8 @@ static ASS_Image **emit_clip_mask(RenderContext *state, uint32_t clip_id,
     uint32_t flags = RUN_FLAG_CLIP_MASK |
                      (state->clip_drawing_mode ? RUN_FLAG_CLIP_INVERSE : 0);
     ASS_Image *im = my_draw_glyph(clip_bm, pos.x, pos.y, 0, IMAGE_TYPE_CHARACTER,
-                                  0, 0, clip_id, flags, 0);
+                                  0, 0, clip_id, flags, 0,
+                                  0, 0, render_priv->width, render_priv->height);
     if (im) {
         *tail = im;
         tail = &im->next;
@@ -1149,6 +1162,19 @@ static ASS_Image *render_text(RenderContext *state)
         tail = emit_clip_mask(state, clip_id, tail);
     }
 
+    // Outline-mode rectangular \clip: every deferred run carries the visible rect
+    // (storage px) so the consumer intersects its drawn area with it. Defaults to
+    // the full frame (no-op) when there's no rect clip. Inverse rect \iclip is not
+    // expressed this way (the non-deferred path's render_glyph_i handles that).
+    ASS_Renderer *rp = state->renderer;
+    int32_t rcx0 = 0, rcy0 = 0, rcx1 = rp->width, rcy1 = rp->height;
+    if (!state->clip_mode) {
+        rcx0 = FFMINMAX(state->clip_x0, 0, rp->width);
+        rcy0 = FFMINMAX(state->clip_y0, 0, rp->height);
+        rcx1 = FFMINMAX(state->clip_x1, 0, rp->width);
+        rcy1 = FFMINMAX(state->clip_y1, 0, rp->height);
+    }
+
     for (unsigned i = 0; i < n_bitmaps; i++) {
         CombinedBitmapInfo *info = &bitmaps[i];
         if (info->deferred) {
@@ -1157,7 +1183,7 @@ static ASS_Image *render_text(RenderContext *state)
             if (state->border_style != 4 &&
                 (info->filter.shadow.x || info->filter.shadow.y))
                 tail = render_shadow_deferred(info, run_base + n_bitmaps + i + 1,
-                                              clip_id, tail);
+                                              clip_id, rcx0, rcy0, rcx1, rcy1, tail);
             continue;
         }
         if (!info->bm_s || state->border_style == 4)
@@ -1171,7 +1197,8 @@ static ASS_Image *render_text(RenderContext *state)
     for (unsigned i = 0; i < n_bitmaps; i++) {
         CombinedBitmapInfo *info = &bitmaps[i];
         if (info->deferred) {
-            tail = render_run_deferred(info, true, run_base + i + 1, clip_id, tail);
+            tail = render_run_deferred(info, true, run_base + i + 1, clip_id,
+                                       rcx0, rcy0, rcx1, rcy1, tail);
             continue;
         }
         if (!info->bm_o)
@@ -1190,7 +1217,8 @@ static ASS_Image *render_text(RenderContext *state)
     for (unsigned i = 0; i < n_bitmaps; i++) {
         CombinedBitmapInfo *info = &bitmaps[i];
         if (info->deferred) {
-            tail = render_run_deferred(info, false, run_base + i + 1, clip_id, tail);
+            tail = render_run_deferred(info, false, run_base + i + 1, clip_id,
+                                       rcx0, rcy0, rcx1, rcy1, tail);
             free(info->bitmaps);    // owned by us in deferred mode (no combine)
             info->bitmaps = NULL;
             continue;
