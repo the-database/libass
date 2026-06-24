@@ -115,6 +115,8 @@ bool ass_alloc_bitmap(const BitmapEngine *engine, Bitmap *bm,
     bm->h = h;
     bm->stride = s;
     bm->buffer = buf;
+    bm->segments = NULL;    // outline-deferred mode sets these; a CPU-rasterized
+    bm->n_segments = 0;     // bitmap has none -- never leave them uninitialized
     return true;
 }
 
