@@ -113,6 +113,14 @@ typedef struct ass_image {
     // relative to (dst_x, dst_y). w/h is the coverage bounding box.
     int32_t *outline;
     int32_t n_outline;
+
+    // Outline mode vector \clip: the clip is emitted as its own image with
+    // run_flags bit 1 (RUN_FLAG_CLIP_MASK) set -- its `outline` is the clip
+    // drawing's coverage, to rasterize into a mask (bit 2 RUN_FLAG_CLIP_INVERSE
+    // for \iclip). Every image of a clipped event carries `clip_id` == that mask
+    // image's run_id; the consumer multiplies the run coverage by the mask.
+    // 0 means the image is not clipped.
+    uint32_t clip_id;
 } ASS_Image;
 
 /*
