@@ -137,6 +137,8 @@ static inline unsigned ass_atomic_load_uint(const ass_atomic_uint_t *p)
 { return *p; }
 static inline void     ass_atomic_store_uint(ass_atomic_uint_t *p, unsigned v)
 { _InterlockedExchange((volatile long *) p, (long) v); }
+static inline unsigned ass_atomic_add_uint(ass_atomic_uint_t *p, unsigned n)
+{ return (unsigned) _InterlockedExchangeAdd((volatile long *) p, (long) n); }
 
 #else
 
@@ -158,6 +160,8 @@ static inline unsigned ass_atomic_load_uint(const ass_atomic_uint_t *p)
 { return atomic_load_explicit(p, memory_order_relaxed); }
 static inline void     ass_atomic_store_uint(ass_atomic_uint_t *p, unsigned v)
 { atomic_store_explicit(p, v, memory_order_relaxed); }
+static inline unsigned ass_atomic_add_uint(ass_atomic_uint_t *p, unsigned n)
+{ return atomic_fetch_add_explicit(p, n, memory_order_relaxed); }
 
 #endif // atomics backend
 
@@ -217,6 +221,7 @@ static inline void   ass_atomic_store_size(ass_atomic_size_t *p, size_t v) { *p 
 
 static inline unsigned ass_atomic_load_uint(const ass_atomic_uint_t *p) { return *p; }
 static inline void     ass_atomic_store_uint(ass_atomic_uint_t *p, unsigned v) { *p = v; }
+static inline unsigned ass_atomic_add_uint(ass_atomic_uint_t *p, unsigned n) { unsigned o = *p; *p += n; return o; }
 
 #endif // CONFIG_THREADS
 
