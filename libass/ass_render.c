@@ -1114,7 +1114,11 @@ static ASS_Image *render_text(RenderContext *state)
     }
 
     *tail = 0;
-    blend_vector_clip(state, head);
+    // Vector \clip multiplies each image's CPU coverage; outline-deferred images
+    // have none (segments only), so skip it (clip not applied -- a known
+    // limitation, to be moved to the GPU).
+    if (!state->renderer->outline_deferred)
+        blend_vector_clip(state, head);
 
     return head;
 }
