@@ -393,11 +393,13 @@ static bool composite_deferrable(RenderContext *state)
 static ASS_Image *my_draw_glyph(Bitmap *bm, int dst_x, int dst_y,
                                 uint32_t color, unsigned type,
                                 double blur_x, double blur_y,
-                                uint32_t run_id, uint32_t run_flags)
+                                uint32_t run_id, uint32_t run_flags,
+                                uint32_t clip_id)
 {
     ASS_ImagePriv *img = malloc(sizeof(ASS_ImagePriv));
     if (!img)
         return NULL;
+    img->result.clip_id = clip_id;
     img->result.w = bm->w;
     img->result.h = bm->h;
     img->result.stride = bm->stride;
@@ -422,8 +424,14 @@ static ASS_Image *my_draw_glyph(Bitmap *bm, int dst_x, int dst_y,
 
 // Emit the glyphs of a deferred run for one coverage layer (outline bm_o or
 // fill bm), in the run's order. Returns the new image-list tail.
+// run_flags ABI bits (also read by the GPU consumer in mpv):
+#define RUN_FLAG_FIX_OUTLINE  0x1   // subtract fill from border (fix_outline)
+#define RUN_FLAG_CLIP_MASK    0x2   // this image is a vector-clip mask, not visible
+#define RUN_FLAG_CLIP_INVERSE 0x4   // the clip mask is inverse (\iclip)
+
 static ASS_Image **render_run_deferred(CombinedBitmapInfo *info, bool outline,
-                                       uint32_t run_id, ASS_Image **tail)
+                                       uint32_t run_id, uint32_t clip_id,
+                                       ASS_Image **tail)
 {
     // Clean run_flags ABI for the GPU consumer: bit 0 = apply fix_outline
     // (subtract fill from border), matching ass_composite_construct's gate.
@@ -448,7 +456,7 @@ static ASS_Image **render_run_deferred(CombinedBitmapInfo *info, bool outline,
             continue;
         ASS_Vector pos = outline ? ref->pos_o : ref->pos;
         ASS_Image *im = my_draw_glyph(bm, info->x + pos.x, info->y + pos.y,
-                                      color, type, bx, by, run_id, flags);
+                                      color, type, bx, by, run_id, flags, clip_id);
         if (im) {
             *tail = im;
             tail = &im->next;
@@ -462,7 +470,7 @@ static ASS_Image **render_run_deferred(CombinedBitmapInfo *info, bool outline,
 // Emitted before the fill/border runs so it composites behind them. Sub-pixel
 // shadow offset is rounded to whole px (shadows are soft -- visually identical).
 static ASS_Image **render_shadow_deferred(CombinedBitmapInfo *info, uint32_t run_id,
-                                          ASS_Image **tail)
+                                          uint32_t clip_id, ASS_Image **tail)
 {
     uint32_t color = info->c[3];
     int sx = lround(info->filter.shadow.x / 64.0);
@@ -482,7 +490,8 @@ static ASS_Image **render_shadow_deferred(CombinedBitmapInfo *info, uint32_t run
                 continue;
             ASS_Vector pos = o ? ref->pos_o : ref->pos;
             ASS_Image *im = my_draw_glyph(bm, info->x + pos.x + sx, info->y + pos.y + sy,
-                                          color, IMAGE_TYPE_CHARACTER, bx, by, run_id, 1);
+                                          color, IMAGE_TYPE_CHARACTER, bx, by, run_id, 1,
+                                          clip_id);
             if (im) {
                 *tail = im;
                 tail = &im->next;
@@ -1067,6 +1076,52 @@ static void blend_vector_clip(RenderContext *state, ASS_Image *head)
     }
 }
 
+// Outline mode: emit the vector \clip drawing as a mask image (run_id == clip_id,
+// RUN_FLAG_CLIP_MASK). The clip bitmap goes through the same outline-deferred
+// raster path, so it already carries segments -- reuse blend_vector_clip's setup.
+static ASS_Image **emit_clip_mask(RenderContext *state, uint32_t clip_id,
+                                  ASS_Image **tail)
+{
+    if (!state->clip_drawing_text.str)
+        return tail;
+    ASS_Renderer *render_priv = state->renderer;
+
+    OutlineHashKey ol_key;
+    ol_key.type = OUTLINE_DRAWING;
+    ol_key.u.drawing.text = state->clip_drawing_text;
+
+    double m[3][3] = {{0}};
+    int32_t scale_base = lshiftwrapi(1, state->clip_drawing_scale - 1);
+    double w = scale_base > 0 ? (1.0 / scale_base) : 0;
+    m[0][0] = state->screen_scale_x * w;
+    m[1][1] = state->screen_scale_y * w;
+    m[2][2] = 1;
+    m[0][2] = int_to_d6(render_priv->settings.left_margin);
+    m[1][2] = int_to_d6(render_priv->settings.top_margin);
+
+    ASS_Vector pos;
+    BitmapHashKey key;
+    key.outline = ass_cache_get(render_priv->cache.outline_cache, &ol_key, render_priv);
+    if (!key.outline || !key.outline->valid ||
+            !quantize_transform(m, &pos, NULL, true, &key))
+        return tail;
+
+    Bitmap *clip_bm = ass_cache_get(render_priv->cache.bitmap_cache, &key,
+                                    &(BitmapConstructCtx){ state, &state->rasterizer });
+    if (!clip_bm || (!clip_bm->buffer && !clip_bm->n_segments))
+        return tail;
+
+    uint32_t flags = RUN_FLAG_CLIP_MASK |
+                     (state->clip_drawing_mode ? RUN_FLAG_CLIP_INVERSE : 0);
+    ASS_Image *im = my_draw_glyph(clip_bm, pos.x, pos.y, 0, IMAGE_TYPE_CHARACTER,
+                                  0, 0, clip_id, flags, 0);
+    if (im) {
+        *tail = im;
+        tail = &im->next;
+    }
+    return tail;
+}
+
 /**
  * \brief Convert TextInfo struct to ASS_Image list
  * Splits glyphs in halves when needed (for \kf karaoke).
@@ -1080,11 +1135,19 @@ static ASS_Image *render_text(RenderContext *state)
 
     // Run ids must be unique across the whole frame, not just this event, or
     // mpv's compositor would merge same-index runs from different events into
-    // one region. Reserve a frame-wide block of 2*n_bitmaps (one run per bitmap
-    // for fill/border, plus a second set for deferred shadows). Atomic: events
-    // may render in parallel.
+    // one region. Reserve a frame-wide block of 2*n_bitmaps (fill/border + a
+    // second set for deferred shadows) plus 1 for this event's clip mask.
+    // Atomic: events may render in parallel.
     uint32_t run_base = ass_atomic_add_uint(&state->renderer->deferred_run_base,
-                                            n_bitmaps * 2);
+                                            n_bitmaps * 2 + 1);
+
+    // Outline-mode vector \clip: emit the clip drawing as a mask run; every run
+    // of this event carries clip_id so the GPU multiplies its coverage by it.
+    uint32_t clip_id = 0;
+    if (state->renderer->outline_deferred && state->clip_drawing_text.str) {
+        clip_id = run_base + n_bitmaps * 2 + 1;
+        tail = emit_clip_mask(state, clip_id, tail);
+    }
 
     for (unsigned i = 0; i < n_bitmaps; i++) {
         CombinedBitmapInfo *info = &bitmaps[i];
@@ -1093,7 +1156,8 @@ static ASS_Image *render_text(RenderContext *state)
             // run, behind the fill/border (drawn next).
             if (state->border_style != 4 &&
                 (info->filter.shadow.x || info->filter.shadow.y))
-                tail = render_shadow_deferred(info, run_base + n_bitmaps + i + 1, tail);
+                tail = render_shadow_deferred(info, run_base + n_bitmaps + i + 1,
+                                              clip_id, tail);
             continue;
         }
         if (!info->bm_s || state->border_style == 4)
@@ -1107,7 +1171,7 @@ static ASS_Image *render_text(RenderContext *state)
     for (unsigned i = 0; i < n_bitmaps; i++) {
         CombinedBitmapInfo *info = &bitmaps[i];
         if (info->deferred) {
-            tail = render_run_deferred(info, true, run_base + i + 1, tail);
+            tail = render_run_deferred(info, true, run_base + i + 1, clip_id, tail);
             continue;
         }
         if (!info->bm_o)
@@ -1126,7 +1190,7 @@ static ASS_Image *render_text(RenderContext *state)
     for (unsigned i = 0; i < n_bitmaps; i++) {
         CombinedBitmapInfo *info = &bitmaps[i];
         if (info->deferred) {
-            tail = render_run_deferred(info, false, run_base + i + 1, tail);
+            tail = render_run_deferred(info, false, run_base + i + 1, clip_id, tail);
             free(info->bitmaps);    // owned by us in deferred mode (no combine)
             info->bitmaps = NULL;
             continue;
