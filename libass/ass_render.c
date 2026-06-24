@@ -457,6 +457,41 @@ static ASS_Image **render_run_deferred(CombinedBitmapInfo *info, bool outline,
     return tail;
 }
 
+// Deferred shadow: emit each glyph's border (or fill) coverage shifted by the
+// run's shadow offset, in the shadow colour, as its own coverage run (run_id).
+// Emitted before the fill/border runs so it composites behind them. Sub-pixel
+// shadow offset is rounded to whole px (shadows are soft -- visually identical).
+static ASS_Image **render_shadow_deferred(CombinedBitmapInfo *info, uint32_t run_id,
+                                          ASS_Image **tail)
+{
+    uint32_t color = info->c[3];
+    int sx = lround(info->filter.shadow.x / 64.0);
+    int sy = lround(info->filter.shadow.y / 64.0);
+    double bx = restore_blur(info->filter.blur_x);
+    double by = restore_blur(info->filter.blur_y);
+    bx = bx > 0.001 ? sqrt(bx) : 0.0;
+    by = by > 0.001 ? sqrt(by) : 0.0;
+    // The shadow is the SOLID silhouette: emit both the fill and the border (a
+    // ring) into one run -- they combine (saturating) to the filled dilated
+    // shape, matching libass's bm_s (derived from the border before fix_outline).
+    for (size_t j = 0; j < info->bitmap_count; j++) {
+        BitmapRef *ref = &info->bitmaps[j];
+        for (int o = 0; o < 2; o++) {
+            Bitmap *bm = o ? ref->bm_o : ref->bm;
+            if (!bm || (!bm->buffer && !bm->n_segments))
+                continue;
+            ASS_Vector pos = o ? ref->pos_o : ref->pos;
+            ASS_Image *im = my_draw_glyph(bm, info->x + pos.x + sx, info->y + pos.y + sy,
+                                          color, IMAGE_TYPE_CHARACTER, bx, by, run_id, 1);
+            if (im) {
+                *tail = im;
+                tail = &im->next;
+            }
+        }
+    }
+    return tail;
+}
+
 /**
  * \brief Mapping between script and screen coordinates
  */
@@ -1043,8 +1078,24 @@ static ASS_Image *render_text(RenderContext *state)
     unsigned n_bitmaps = state->text_info.n_bitmaps;
     CombinedBitmapInfo *bitmaps = state->text_info.combined_bitmaps;
 
+    // Run ids must be unique across the whole frame, not just this event, or
+    // mpv's compositor would merge same-index runs from different events into
+    // one region. Reserve a frame-wide block of 2*n_bitmaps (one run per bitmap
+    // for fill/border, plus a second set for deferred shadows). Atomic: events
+    // may render in parallel.
+    uint32_t run_base = ass_atomic_add_uint(&state->renderer->deferred_run_base,
+                                            n_bitmaps * 2);
+
     for (unsigned i = 0; i < n_bitmaps; i++) {
         CombinedBitmapInfo *info = &bitmaps[i];
+        if (info->deferred) {
+            // Outline mode: shadow coverage isn't on the CPU; emit it as its own
+            // run, behind the fill/border (drawn next).
+            if (state->border_style != 4 &&
+                (info->filter.shadow.x || info->filter.shadow.y))
+                tail = render_shadow_deferred(info, run_base + n_bitmaps + i + 1, tail);
+            continue;
+        }
         if (!info->bm_s || state->border_style == 4)
             continue;
 
@@ -1052,13 +1103,6 @@ static ASS_Image *render_text(RenderContext *state)
             render_glyph(state, info->bm_s, info->x, info->y, info->c[3], 0,
                          1000000, tail, IMAGE_TYPE_SHADOW, info->image);
     }
-
-    // Run ids must be unique across the whole frame, not just this event, or
-    // mpv's compositor would merge same-index runs from different events into
-    // one region. Reserve a frame-wide block for this event's n_bitmaps runs
-    // (atomic: events may render in parallel).
-    uint32_t run_base = ass_atomic_add_uint(&state->renderer->deferred_run_base,
-                                            n_bitmaps);
 
     for (unsigned i = 0; i < n_bitmaps; i++) {
         CombinedBitmapInfo *info = &bitmaps[i];
