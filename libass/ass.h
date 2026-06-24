@@ -121,6 +121,13 @@ typedef struct ass_image {
     // image's run_id; the consumer multiplies the run coverage by the mask.
     // 0 means the image is not clipped.
     uint32_t clip_id;
+
+    // Outline mode rectangular \clip: the visible rectangle in storage pixels
+    // (same space as dst_x/dst_y). The consumer intersects the run's drawn area
+    // with this rect. Equal to the full frame when there is no rectangular clip
+    // (so intersecting is a no-op). Inverse rectangular \iclip is not expressed
+    // here (it goes through the clip-mask path instead).
+    int32_t clip_rx0, clip_ry0, clip_rx1, clip_ry1;
 } ASS_Image;
 
 /*
