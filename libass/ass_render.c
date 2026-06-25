@@ -438,17 +438,19 @@ static ASS_Image *my_draw_glyph(Bitmap *bm, int dst_x, int dst_y,
 #define RUN_FLAG_CLIP_MASK    0x2   // this image is a vector-clip mask, not visible
 #define RUN_FLAG_CLIP_INVERSE 0x4   // the clip mask is inverse (\iclip)
 #define RUN_FLAG_KF_WIPE      0x8   // \kf fill: color left of wipe_x, color2 right
+#define RUN_FLAG_RECT_INVERSE 0x10  // \iclip rect: the clip rect is EXCLUDED, not visible
 
 static ASS_Image **render_run_deferred(CombinedBitmapInfo *info, bool outline,
                                        uint32_t run_id, uint32_t clip_id,
                                        int32_t rcx0, int32_t rcy0,
                                        int32_t rcx1, int32_t rcy1,
-                                       ASS_Image **tail)
+                                       bool rect_inverse, ASS_Image **tail)
 {
     // Clean run_flags ABI for the GPU consumer: bit 0 = apply fix_outline
     // (subtract fill from border), matching ass_composite_construct's gate.
     // Deferred runs never carry a shadow, so only FILL_IN_BORDER matters.
     uint32_t flags = (info->filter.flags & FILTER_FILL_IN_BORDER) ? 0 : 1;
+    if (rect_inverse) flags |= RUN_FLAG_RECT_INVERSE;
     uint32_t color = outline ? info->c[2] : info->c[0];
     // Karaoke recolours the fill only (the border stays uniform c[2]). \k/\ko
     // switch the whole syllable (sung c[0] once effect_timing>0, else unsung
@@ -508,7 +510,7 @@ static ASS_Image **render_shadow_deferred(CombinedBitmapInfo *info, uint32_t run
                                           uint32_t clip_id,
                                           int32_t rcx0, int32_t rcy0,
                                           int32_t rcx1, int32_t rcy1,
-                                          ASS_Image **tail)
+                                          bool rect_inverse, ASS_Image **tail)
 {
     uint32_t color = info->c[3];
     int sx = lround(info->filter.shadow.x / 64.0);
@@ -528,7 +530,8 @@ static ASS_Image **render_shadow_deferred(CombinedBitmapInfo *info, uint32_t run
                 continue;
             ASS_Vector pos = o ? ref->pos_o : ref->pos;
             ASS_Image *im = my_draw_glyph(bm, info->x + pos.x + sx, info->y + pos.y + sy,
-                                          color, IMAGE_TYPE_CHARACTER, bx, by, run_id, 1,
+                                          color, IMAGE_TYPE_CHARACTER, bx, by, run_id,
+                                          1 | (rect_inverse ? RUN_FLAG_RECT_INVERSE : 0),
                                           clip_id, rcx0, rcy0, rcx1, rcy1, color, 0);
             if (im) {
                 *tail = im;
@@ -1188,13 +1191,20 @@ static ASS_Image *render_text(RenderContext *state)
         tail = emit_clip_mask(state, clip_id, tail);
     }
 
-    // Outline-mode rectangular \clip: every deferred run carries the visible rect
-    // (storage px) so the consumer intersects its drawn area with it. Defaults to
-    // the full frame (no-op) when there's no rect clip. Inverse rect \iclip is not
-    // expressed this way (the non-deferred path's render_glyph_i handles that).
+    // Outline-mode rectangular \clip: every deferred run carries a rect (storage
+    // px). Normal \clip -> the visible rect, intersected by the consumer (full
+    // frame = no-op when unclipped). Inverse \iclip -> the EXCLUDED rect plus
+    // RUN_FLAG_RECT_INVERSE, which the consumer subtracts from the drawn area.
     ASS_Renderer *rp = state->renderer;
     int32_t rcx0 = 0, rcy0 = 0, rcx1 = rp->width, rcy1 = rp->height;
-    if (!state->clip_mode) {
+    bool rect_inverse = false;
+    if (state->clip_mode) {
+        rect_inverse = true;
+        rcx0 = FFMINMAX(state->clip_x0, 0, rp->width);
+        rcy0 = FFMINMAX(state->clip_y0, 0, rp->height);
+        rcx1 = FFMINMAX(state->clip_x1, 0, rp->width);
+        rcy1 = FFMINMAX(state->clip_y1, 0, rp->height);
+    } else {
         rcx0 = FFMINMAX(state->clip_x0, 0, rp->width);
         rcy0 = FFMINMAX(state->clip_y0, 0, rp->height);
         rcx1 = FFMINMAX(state->clip_x1, 0, rp->width);
@@ -1209,7 +1219,8 @@ static ASS_Image *render_text(RenderContext *state)
             if (state->border_style != 4 &&
                 (info->filter.shadow.x || info->filter.shadow.y))
                 tail = render_shadow_deferred(info, run_base + n_bitmaps + i + 1,
-                                              clip_id, rcx0, rcy0, rcx1, rcy1, tail);
+                                              clip_id, rcx0, rcy0, rcx1, rcy1,
+                                              rect_inverse, tail);
             continue;
         }
         if (!info->bm_s || state->border_style == 4)
@@ -1224,7 +1235,7 @@ static ASS_Image *render_text(RenderContext *state)
         CombinedBitmapInfo *info = &bitmaps[i];
         if (info->deferred) {
             tail = render_run_deferred(info, true, run_base + i + 1, clip_id,
-                                       rcx0, rcy0, rcx1, rcy1, tail);
+                                       rcx0, rcy0, rcx1, rcy1, rect_inverse, tail);
             continue;
         }
         if (!info->bm_o)
@@ -1244,7 +1255,7 @@ static ASS_Image *render_text(RenderContext *state)
         CombinedBitmapInfo *info = &bitmaps[i];
         if (info->deferred) {
             tail = render_run_deferred(info, false, run_base + i + 1, clip_id,
-                                       rcx0, rcy0, rcx1, rcy1, tail);
+                                       rcx0, rcy0, rcx1, rcy1, rect_inverse, tail);
             free(info->bitmaps);    // owned by us in deferred mode (no combine)
             info->bitmaps = NULL;
             continue;
