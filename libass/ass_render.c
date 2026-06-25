@@ -353,9 +353,20 @@ static ASS_Image *my_draw_bitmap(unsigned char *bitmap, int bitmap_w,
 
     // Combined (legacy / blur-deferred) images are not per-glyph: a downstream
     // GPU compositor must route them the normal way, so zero the glyph fields.
+    // Initialize EVERY outline-mode field too -- the consumer (mpv packer) copies
+    // them unconditionally, so leaving them uninitialized feeds garbage downstream
+    // (intermittent crashes, e.g. the OSD/stats path that recycles these images).
     img->result.glyph_id = 0;
     img->result.run_id = 0;
     img->result.run_flags = 0;
+    img->result.outline = NULL;
+    img->result.n_outline = 0;
+    img->result.clip_id = 0;
+    img->result.clip_rx0 = img->result.clip_ry0 = 0;
+    img->result.clip_rx1 = img->result.clip_ry1 = 0;
+    img->result.color2 = color;
+    img->result.wipe_x = 0;
+    img->result.be = 0;
 
     img->source = source;
     ass_cache_inc_ref(source);
