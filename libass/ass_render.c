@@ -396,7 +396,8 @@ static ASS_Image *my_draw_glyph(Bitmap *bm, int dst_x, int dst_y,
                                 uint32_t run_id, uint32_t run_flags,
                                 uint32_t clip_id,
                                 int32_t rcx0, int32_t rcy0,
-                                int32_t rcx1, int32_t rcy1)
+                                int32_t rcx1, int32_t rcy1,
+                                uint32_t color2, int32_t wipe_x)
 {
     ASS_ImagePriv *img = malloc(sizeof(ASS_ImagePriv));
     if (!img)
@@ -406,6 +407,8 @@ static ASS_Image *my_draw_glyph(Bitmap *bm, int dst_x, int dst_y,
     img->result.clip_ry0 = rcy0;
     img->result.clip_rx1 = rcx1;
     img->result.clip_ry1 = rcy1;
+    img->result.color2 = color2;
+    img->result.wipe_x = wipe_x;
     img->result.w = bm->w;
     img->result.h = bm->h;
     img->result.stride = bm->stride;
@@ -434,6 +437,7 @@ static ASS_Image *my_draw_glyph(Bitmap *bm, int dst_x, int dst_y,
 #define RUN_FLAG_FIX_OUTLINE  0x1   // subtract fill from border (fix_outline)
 #define RUN_FLAG_CLIP_MASK    0x2   // this image is a vector-clip mask, not visible
 #define RUN_FLAG_CLIP_INVERSE 0x4   // the clip mask is inverse (\iclip)
+#define RUN_FLAG_KF_WIPE      0x8   // \kf fill: color left of wipe_x, color2 right
 
 static ASS_Image **render_run_deferred(CombinedBitmapInfo *info, bool outline,
                                        uint32_t run_id, uint32_t clip_id,
@@ -446,6 +450,20 @@ static ASS_Image **render_run_deferred(CombinedBitmapInfo *info, bool outline,
     // Deferred runs never carry a shadow, so only FILL_IN_BORDER matters.
     uint32_t flags = (info->filter.flags & FILTER_FILL_IN_BORDER) ? 0 : 1;
     uint32_t color = outline ? info->c[2] : info->c[0];
+    // Karaoke recolours the fill only (the border stays uniform c[2]). \k/\ko
+    // switch the whole syllable (sung c[0] once effect_timing>0, else unsung
+    // c[1]); \kf wipes -- color left of screen-x effect_timing, color2 right.
+    uint32_t color2 = color;
+    int32_t wipe_x = 0;
+    if (!outline) {
+        if (info->effect_type == EF_KARAOKE || info->effect_type == EF_KARAOKE_KO) {
+            color = color2 = (info->effect_timing > 0) ? info->c[0] : info->c[1];
+        } else if (info->effect_type == EF_KARAOKE_KF) {
+            color = info->c[0];            color2 = info->c[1];
+            wipe_x = info->effect_timing;
+            flags |= RUN_FLAG_KF_WIPE;
+        }
+    }
     unsigned type = outline ? IMAGE_TYPE_OUTLINE : IMAGE_TYPE_CHARACTER;
     double bx = restore_blur(info->filter.blur_x);
     double by = restore_blur(info->filter.blur_y);
@@ -465,7 +483,7 @@ static ASS_Image **render_run_deferred(CombinedBitmapInfo *info, bool outline,
         ASS_Vector pos = outline ? ref->pos_o : ref->pos;
         ASS_Image *im = my_draw_glyph(bm, info->x + pos.x, info->y + pos.y,
                                       color, type, bx, by, run_id, flags, clip_id,
-                                      rcx0, rcy0, rcx1, rcy1);
+                                      rcx0, rcy0, rcx1, rcy1, color2, wipe_x);
         if (im) {
             *tail = im;
             tail = &im->next;
@@ -503,7 +521,7 @@ static ASS_Image **render_shadow_deferred(CombinedBitmapInfo *info, uint32_t run
             ASS_Vector pos = o ? ref->pos_o : ref->pos;
             ASS_Image *im = my_draw_glyph(bm, info->x + pos.x + sx, info->y + pos.y + sy,
                                           color, IMAGE_TYPE_CHARACTER, bx, by, run_id, 1,
-                                          clip_id, rcx0, rcy0, rcx1, rcy1);
+                                          clip_id, rcx0, rcy0, rcx1, rcy1, color, 0);
             if (im) {
                 *tail = im;
                 tail = &im->next;
@@ -1127,7 +1145,7 @@ static ASS_Image **emit_clip_mask(RenderContext *state, uint32_t clip_id,
                      (state->clip_drawing_mode ? RUN_FLAG_CLIP_INVERSE : 0);
     ASS_Image *im = my_draw_glyph(clip_bm, pos.x, pos.y, 0, IMAGE_TYPE_CHARACTER,
                                   0, 0, clip_id, flags, 0,
-                                  0, 0, render_priv->width, render_priv->height);
+                                  0, 0, render_priv->width, render_priv->height, 0, 0);
     if (im) {
         *tail = im;
         tail = &im->next;
