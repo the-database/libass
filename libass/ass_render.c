@@ -397,11 +397,12 @@ static ASS_Image *my_draw_glyph(Bitmap *bm, int dst_x, int dst_y,
                                 uint32_t clip_id,
                                 int32_t rcx0, int32_t rcy0,
                                 int32_t rcx1, int32_t rcy1,
-                                uint32_t color2, int32_t wipe_x)
+                                uint32_t color2, int32_t wipe_x, int32_t be)
 {
     ASS_ImagePriv *img = malloc(sizeof(ASS_ImagePriv));
     if (!img)
         return NULL;
+    img->result.be = be;
     img->result.clip_id = clip_id;
     img->result.clip_rx0 = rcx0;
     img->result.clip_ry0 = rcy0;
@@ -467,24 +468,19 @@ static ASS_Image **render_run_deferred(CombinedBitmapInfo *info, bool outline,
         }
     }
     unsigned type = outline ? IMAGE_TYPE_OUTLINE : IMAGE_TYPE_CHARACTER;
-    double bxv = restore_blur(info->filter.blur_x);   // gaussian variance
-    double byv = restore_blur(info->filter.blur_y);
-    bxv = bxv > 0.001 ? bxv : 0.0;
-    byv = byv > 0.001 ? byv : 0.0;
+    double bx = restore_blur(info->filter.blur_x);
+    double by = restore_blur(info->filter.blur_y);
+    bx = bx > 0.001 ? sqrt(bx) : 0.0;
+    by = by > 0.001 ? sqrt(by) : 0.0;
     // The fill is only blurred when there's no (nonzero) border, matching
     // ass_composite_construct's blur_bm; the border is always blurred.
     bool blur_fill = !(info->filter.flags & FILTER_NONZERO_BORDER) ||
                      (info->filter.flags & FILTER_BORDER_STYLE_3);
     if (!outline && !blur_fill)
-        bxv = byv = 0.0;
-    // \be edge-blur: the CPU applies `be` iterations of a [1,2,1]/4 box (variance
-    // 0.5 each) to the bitmap, which has no equivalent in outline mode -- fold it
-    // into the GPU gaussian (variances add under convolution).
-    double be_var = info->filter.be * 0.5;
-    bxv += be_var;
-    byv += be_var;
-    double bx = bxv > 0.001 ? sqrt(bxv) : 0.0;
-    double by = byv > 0.001 ? sqrt(byv) : 0.0;
+        bx = by = 0.0;
+    // \be edge-blur: the consumer runs `be` iterations of the [1,2,1]/4 box on
+    // the GPU coverage (no bitmap here to run the CPU be_blur on).
+    int be = info->filter.be;
     for (size_t j = 0; j < info->bitmap_count; j++) {
         BitmapRef *ref = &info->bitmaps[j];
         Bitmap *bm = outline ? ref->bm_o : ref->bm;
@@ -493,7 +489,7 @@ static ASS_Image **render_run_deferred(CombinedBitmapInfo *info, bool outline,
         ASS_Vector pos = outline ? ref->pos_o : ref->pos;
         ASS_Image *im = my_draw_glyph(bm, info->x + pos.x, info->y + pos.y,
                                       color, type, bx, by, run_id, flags, clip_id,
-                                      rcx0, rcy0, rcx1, rcy1, color2, wipe_x);
+                                      rcx0, rcy0, rcx1, rcy1, color2, wipe_x, be);
         if (im) {
             *tail = im;
             tail = &im->next;
@@ -532,7 +528,7 @@ static ASS_Image **render_shadow_deferred(CombinedBitmapInfo *info, uint32_t run
             ASS_Image *im = my_draw_glyph(bm, info->x + pos.x + sx, info->y + pos.y + sy,
                                           color, IMAGE_TYPE_CHARACTER, bx, by, run_id,
                                           1 | (rect_inverse ? RUN_FLAG_RECT_INVERSE : 0),
-                                          clip_id, rcx0, rcy0, rcx1, rcy1, color, 0);
+                                          clip_id, rcx0, rcy0, rcx1, rcy1, color, 0, 0);
             if (im) {
                 *tail = im;
                 tail = &im->next;
@@ -1156,7 +1152,7 @@ static ASS_Image **emit_clip_mask(RenderContext *state, uint32_t clip_id,
                      (state->clip_drawing_mode ? RUN_FLAG_CLIP_INVERSE : 0);
     ASS_Image *im = my_draw_glyph(clip_bm, pos.x, pos.y, 0, IMAGE_TYPE_CHARACTER,
                                   0, 0, clip_id, flags, 0,
-                                  0, 0, render_priv->width, render_priv->height, 0, 0);
+                                  0, 0, render_priv->width, render_priv->height, 0, 0, 0);
     if (im) {
         *tail = im;
         tail = &im->next;
