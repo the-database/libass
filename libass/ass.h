@@ -135,6 +135,10 @@ typedef struct ass_image {
     // fill in the right colour with no wipe (bit clear, color2/wipe_x unused).
     uint32_t color2;
     int32_t wipe_x;
+
+    // Outline-mode \be edge-blur: the consumer applies `be` iterations of the
+    // [1,2,1]/4 box to this run's coverage (0 = none).
+    int32_t be;
 } ASS_Image;
 
 /*
