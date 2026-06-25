@@ -128,6 +128,13 @@ typedef struct ass_image {
     // (so intersecting is a no-op). Inverse rectangular \iclip is not expressed
     // here (it goes through the clip-mask path instead).
     int32_t clip_rx0, clip_ry0, clip_rx1, clip_ry1;
+
+    // Outline-mode \kf karaoke wipe: when run_flags bit 3 (RUN_FLAG_KF_WIPE) is
+    // set on a fill image, `color` paints left of screen-x `wipe_x` (the sung
+    // part) and `color2` to its right (unsung). Binary \k/\ko emit the whole
+    // fill in the right colour with no wipe (bit clear, color2/wipe_x unused).
+    uint32_t color2;
+    int32_t wipe_x;
 } ASS_Image;
 
 /*
