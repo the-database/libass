@@ -440,6 +440,7 @@ static ASS_Image *my_draw_glyph(Bitmap *bm, int dst_x, int dst_y,
 #define RUN_FLAG_CLIP_INVERSE 0x4   // the clip mask is inverse (\iclip)
 #define RUN_FLAG_KF_WIPE      0x8   // \kf fill: color left of wipe_x, color2 right
 #define RUN_FLAG_RECT_INVERSE 0x10  // \iclip rect: the clip rect is EXCLUDED, not visible
+#define RUN_FLAG_SHADOW       0x20  // this run is a drop shadow (draw behind border+fill)
 
 static ASS_Image **render_run_deferred(CombinedBitmapInfo *info, bool outline,
                                        uint32_t run_id, uint32_t clip_id,
@@ -527,7 +528,7 @@ static ASS_Image **render_shadow_deferred(CombinedBitmapInfo *info, uint32_t run
             ASS_Vector pos = o ? ref->pos_o : ref->pos;
             ASS_Image *im = my_draw_glyph(bm, info->x + pos.x + sx, info->y + pos.y + sy,
                                           color, IMAGE_TYPE_CHARACTER, bx, by, run_id,
-                                          1 | (rect_inverse ? RUN_FLAG_RECT_INVERSE : 0),
+                                          RUN_FLAG_SHADOW | (rect_inverse ? RUN_FLAG_RECT_INVERSE : 0),
                                           clip_id, rcx0, rcy0, rcx1, rcy1, color, 0, 0);
             if (im) {
                 *tail = im;
