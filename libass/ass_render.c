@@ -2919,7 +2919,8 @@ static double restore_blur(int qblur)
 // render_and_combine_glyphs). pos/pos_o are filled in by the raster.
 struct raster_item {
     GlyphInfo *gi;
-    CombinedBitmapInfo *run;
+    size_t run;  // index into text_info->combined_bitmaps (NOT a pointer: that
+                 // array is reallocated as runs grow, which would dangle it)
     int flags;
     ASS_DVector offset;
     ASS_Vector pos, pos_o;
@@ -3065,7 +3066,7 @@ static void render_and_combine_glyphs(RenderContext *state,
                     max_items = ns;
                 }
                 items[n_items++] = (struct raster_item){
-                    .gi = info, .run = current_info, .flags = flags, .offset = offset,
+                    .gi = info, .run = nb_bitmaps - 1, .flags = flags, .offset = offset,
                 };
                 continue;
             }
@@ -3113,7 +3114,7 @@ static void render_and_combine_glyphs(RenderContext *state,
     // Pass C: collect the deferred glyphs into their runs, in original order.
     for (size_t k = 0; k < n_items; k++) {
         GlyphInfo *gi = items[k].gi;
-        CombinedBitmapInfo *ci = items[k].run;
+        CombinedBitmapInfo *ci = &combined_info[items[k].run];
         if (!gi->bm && !gi->bm_o)
             continue;
         if (ci->bitmap_count >= ci->max_bitmap_count) {
