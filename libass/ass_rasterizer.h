@@ -84,5 +84,13 @@ bool ass_rasterizer_fill(const BitmapEngine *engine, RasterizerData *rst,
 int ass_outline_to_segments(const ASS_Outline *o0, const ASS_Outline *o1, int outline_error,
                             int32_t **out, int32_t *left, int32_t *top, int32_t *w, int32_t *h);
 
+// GPU per-tile export: tile-split each into 16px tiles, emit per-tile clipped
+// segments + winding (+ 2-group max-merge) for a per-tile GPU filler (see .c).
+#define TILE_EXPORT_W 11   // tx, ty, ng, group0[type,winding,seg_off,seg_cnt], group1[...]
+#define SEG_EXPORT_W  8    // a, b, c, flags, x_min, y_min, y_max, _ (rescaled; tile-relative)
+int ass_outline_to_tiles(const ASS_Outline *o0, const ASS_Outline *o1, int outline_error,
+                         float **tiles, int *n_tiles, float **segs, int *n_segs,
+                         int32_t *left, int32_t *top, int32_t *w, int32_t *h);
+
 
 #endif /* LIBASS_RASTERIZER_H */

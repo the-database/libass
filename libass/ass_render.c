@@ -1995,14 +1995,29 @@ size_t ass_bitmap_construct(void *key, void *value, void *priv)
     }
 
     if (state->renderer->outline_deferred) {
-        // GPU-rasterizer mode: emit the transformed outline as line segments
-        // instead of rasterizing on the CPU.
+        // GPU-rasterizer mode: tile-split on the CPU and emit per-tile clipped
+        // segments + winding (+ 2-group merge) for a per-tile GPU filler. Packed
+        // into bm->segments as: [n_tiles, n_segs, tiles(float bits), segs(float
+        // bits)] -- the GPU parses this. Matches libass CPU incl. self-intersect.
         memset(bm, 0, sizeof(*bm));
         int32_t left, top, w, h;
-        bm->n_segments = ass_outline_to_segments(&outline[0], &outline[1],
-                                                 RASTERIZER_PRECISION, &bm->segments,
-                                                 &left, &top, &w, &h);
-        bm->left = left; bm->top = top; bm->w = w; bm->h = h;
+        float *tiles = NULL, *segs = NULL; int nt = 0, ns = 0;
+        ass_outline_to_tiles(&outline[0], &outline[1], RASTERIZER_PRECISION,
+                             &tiles, &nt, &segs, &ns, &left, &top, &w, &h);
+        if (nt > 0) {
+            size_t total = 2 + (size_t) nt * TILE_EXPORT_W + (size_t) ns * SEG_EXPORT_W;
+            int32_t *blob = malloc(total * sizeof(int32_t));
+            if (blob) {
+                blob[0] = nt; blob[1] = ns;
+                memcpy(blob + 2, tiles, (size_t) nt * TILE_EXPORT_W * sizeof(float));
+                memcpy(blob + 2 + (size_t) nt * TILE_EXPORT_W, segs,
+                       (size_t) ns * SEG_EXPORT_W * sizeof(float));
+                bm->segments = blob;
+                bm->n_segments = (int) total;
+            }
+            bm->left = left; bm->top = top; bm->w = w; bm->h = h;
+        }
+        free(tiles); free(segs);
     } else if (!ass_outline_to_bitmap(state, ctx->rst, bm, &outline[0], &outline[1])) {
         memset(bm, 0, sizeof(*bm));
     }
