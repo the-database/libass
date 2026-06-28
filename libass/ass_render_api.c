@@ -76,6 +76,17 @@ void ass_set_storage_size(ASS_Renderer *priv, int w, int h)
     }
 }
 
+void ass_set_blur_deferred(ASS_Renderer *priv, int deferred)
+{
+    deferred = !!deferred;
+    if (priv->blur_deferred != deferred) {
+        priv->blur_deferred = deferred;
+        // The composite cache holds (un)blurred bitmaps keyed without regard to
+        // this mode, so it must be dropped when the mode changes.
+        ass_cache_empty(priv->cache.composite_cache);
+    }
+}
+
 void ass_set_shaper(ASS_Renderer *priv, ASS_ShapingLevel level)
 {
     // select the complex shaper for illegal values
@@ -135,6 +146,25 @@ void ass_set_hinting(ASS_Renderer *priv, ASS_Hinting ht)
 void ass_set_line_spacing(ASS_Renderer *priv, double line_spacing)
 {
     priv->settings.line_spacing = line_spacing;
+}
+
+void ass_set_render_thread_count(ASS_Renderer *priv, int threads)
+{
+    if (priv->settings.render_thread_count == threads)
+        return;
+    priv->settings.render_thread_count = threads;
+#if CONFIG_THREADS
+    ass_renderer_update_pool(priv);
+#endif
+}
+
+int ass_get_render_thread_count(ASS_Renderer *priv)
+{
+#if CONFIG_THREADS
+    return priv->pool ? priv->n_threads : 1;
+#else
+    return 1;
+#endif
 }
 
 void ass_set_line_position(ASS_Renderer *priv, double line_position)

@@ -27,6 +27,9 @@
 #include "ass_outline.h"
 #include "ass_bitmap_engine.h"
 
+struct render_context;
+struct rasterizer_data;
+
 typedef struct {
     int32_t left, top;
     int32_t w, h;         // width, height
@@ -41,13 +44,22 @@ void ass_free_bitmap(Bitmap *bm);
 
 struct render_context;
 
-bool ass_outline_to_bitmap(struct render_context *state, Bitmap *bm,
+bool ass_outline_to_bitmap(struct render_context *state, struct rasterizer_data *rst, Bitmap *bm,
                            ASS_Outline *outline1, ASS_Outline *outline2);
 
-void ass_synth_blur(const BitmapEngine *engine, Bitmap *bm,
+// pool (an ASS_ThreadPool *, or NULL) lets a large gaussian blur farm its
+// stripe-independent stages out to idle workers; NULL renders serially.
+void ass_synth_blur(const BitmapEngine *engine, void *pool, Bitmap *bm,
                     int be, double blur_r2x, double blur_r2y);
 
-bool ass_gaussian_blur(const BitmapEngine *engine, Bitmap *bm, double r2x, double r2y);
+bool ass_gaussian_blur(const BitmapEngine *engine, void *pool, Bitmap *bm,
+                       double r2x, double r2y);
+// Like ass_gaussian_blur, but only expands the bitmap to the bounds the blur
+// would produce (zero-padded, content re-centred) WITHOUT convolving. Used by
+// the deferred-blur mode, where the actual gaussian is applied later (e.g. on
+// the GPU) within these pre-sized bounds.
+bool ass_blur_expand_only(const BitmapEngine *engine, Bitmap *bm,
+                          double r2x, double r2y);
 void ass_shift_bitmap(Bitmap *bm, int shift_x, int shift_y);
 void ass_fix_outline(Bitmap *bm_g, Bitmap *bm_o);
 

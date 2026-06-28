@@ -83,6 +83,13 @@ typedef struct ass_image {
     } type;
 
     // New fields can be added here in new ABI-compatible library releases.
+
+    // Deferred-blur mode (ass_set_blur_deferred): the gaussian blur that still
+    // needs to be applied to this image's coverage, as a standard deviation in
+    // bitmap pixels per axis. 0 means no blur is pending (already applied, as
+    // in the default mode). The bitmap bounds (w/h) are already expanded to
+    // hold the blurred result.
+    double blur_x, blur_y;
 } ASS_Image;
 
 /*
@@ -421,6 +428,22 @@ void ass_set_frame_size(ASS_Renderer *priv, int w, int h);
 void ass_set_storage_size(ASS_Renderer *priv, int w, int h);
 
 /**
+ * \brief Defer gaussian blur to the caller instead of applying it in libass.
+ *
+ * When enabled, rendered ASS_Images carry *unblurred* coverage in bitmap
+ * bounds already expanded to hold the blurred result, plus the gaussian
+ * standard deviation to apply, in the new ASS_Image.blur_x / blur_y fields
+ * (0 when no blur is pending). This lets a GPU-accelerated consumer perform
+ * the (expensive) blur itself. Box blur (\be) is still applied in libass.
+ *
+ * Default: off (libass applies the blur, ASS_Image.blur_x/y are 0).
+ *
+ * \param priv renderer handle
+ * \param deferred 0 to disable (default), non-zero to enable
+ */
+void ass_set_blur_deferred(ASS_Renderer *priv, int deferred);
+
+/**
  * \brief Set shaping level. This is merely a hint, the renderer will use
  * whatever is available if the request cannot be fulfilled.
  * \param level shaping level
@@ -605,6 +628,31 @@ int ass_fonts_update(ASS_Renderer *priv);
  */
 void ass_set_cache_limits(ASS_Renderer *priv, int glyph_max,
                           int bitmap_max_size);
+
+/**
+ * \brief Set the number of threads used to render events within a frame.
+ *
+ * Events active at a given timestamp are independent and can be rendered in
+ * parallel. Output is identical to single-threaded rendering regardless of the
+ * thread count. The default is 1 (no threads, identical to older versions).
+ *
+ * This is a no-op in builds compiled without thread support; the count then
+ * stays at 1.
+ *
+ * \param priv renderer handle
+ * \param threads number of worker threads: 1 for single-threaded (default),
+ *                a value <= 0 to pick automatically based on the CPU count,
+ *                or a specific count > 1
+ */
+void ass_set_render_thread_count(ASS_Renderer *priv, int threads);
+
+/**
+ * \brief Get the number of threads actually used for rendering.
+ * \param priv renderer handle
+ * \return the active worker thread count (always 1 if threading is disabled
+ *         at build time or not enabled at runtime)
+ */
+int ass_get_render_thread_count(ASS_Renderer *priv);
 
 /**
  * \brief Render a frame, producing a list of ASS_Image.

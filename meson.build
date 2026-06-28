@@ -128,6 +128,13 @@ if libunibreak_dep.found()
     conf.set('CONFIG_UNIBREAK', 1)
 endif
 
+threads_dep = dependency('threads', required: get_option('threads'))
+threads = threads_dep.found()
+if threads
+    deps += threads_dep
+    conf.set('CONFIG_THREADS', 1)
+endif
+
 png_dep = dependency(
     'libpng',
     version: '>= 1.2.0',
@@ -424,3 +431,4 @@ endif
 
 summary('Font providers', font_providers)
 summary('ASM optimizations', enable_asm, bool_yn: true)
+summary('Multithreading', threads, bool_yn: true)

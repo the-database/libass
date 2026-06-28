@@ -31,6 +31,7 @@ typedef struct ass_font ASS_Font;
 #include "ass_cache.h"
 #include "ass_outline.h"
 #include "ass_arabic_charmap.h"
+#include "ass_threading.h"
 
 #define VERTICAL_LOWER_BOUND 0x02f1
 
@@ -43,6 +44,10 @@ struct ass_font {
     ASS_FontDesc desc;
     ASS_Library *library;
     FT_Library ftlibrary;
+    // Shared, renderer-wide recursive lock serializing all access to this and
+    // every other font's FT_Face / FT_Library / font selector. Points into the
+    // owning ASS_Renderer; no-op in non-threaded builds.
+    ass_rmutex_t *lock;
     int faces_uid[ASS_FONT_MAX_FACES];
     FT_Face faces[ASS_FONT_MAX_FACES];
     struct hb_font_t *hb_fonts[ASS_FONT_MAX_FACES];

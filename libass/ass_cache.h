@@ -32,6 +32,12 @@ typedef uint64_t ass_hashcode;
 
 typedef struct {
     Bitmap bm, bm_o, bm_s;
+    // Deferred-blur mode: the gaussian std-dev (px) to apply downstream (e.g.
+    // on the GPU); 0 when the blur was already applied here. See
+    // ass_set_blur_deferred(). fill_blurred records whether the fill bitmap (bm)
+    // received the blur — it does not when there is a non-zero border.
+    double blur_x, blur_y;
+    bool fill_blurred;
 } CompositeHashValue;
 
 typedef struct {

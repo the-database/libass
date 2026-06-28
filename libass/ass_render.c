@@ -47,6 +47,14 @@
 #define SUBPIXEL_ORDER 3  // ~ log2(64 / POSITION_PRECISION)
 #define BLUR_PRECISION (1.0 / 256)  // blur error as fraction of full input range
 
+// priv for the bitmap cache construct: the render context plus the rasterizer
+// scratch to use. The rasterizer is passed explicitly (not taken from state) so
+// the per-glyph raster can run on a worker thread with its own scratch while
+// sharing the read-only event state.
+typedef struct {
+    RenderContext *state;
+    RasterizerData *rst;
+} BitmapConstructCtx;
 
 static bool text_info_init(TextInfo* text_info)
 {
@@ -99,6 +107,95 @@ static void render_context_done(RenderContext *state)
     text_info_done(&state->text_info);
 }
 
+#if CONFIG_THREADS
+static void destroy_render_pool(ASS_Renderer *priv)
+{
+    if (priv->pool) {
+        ass_thread_pool_destroy(priv->pool);
+        priv->pool = NULL;
+    }
+    if (priv->worker_ctx) {
+        for (int i = 0; i < priv->n_threads; i++) {
+            if (priv->worker_ctx[i]) {
+                render_context_done(priv->worker_ctx[i]);
+                free(priv->worker_ctx[i]);
+            }
+        }
+        free(priv->worker_ctx);
+        priv->worker_ctx = NULL;
+    }
+    if (priv->raster_pool) {
+        for (int i = 0; i < priv->n_threads; i++)
+            ass_rasterizer_done(&priv->raster_pool[i]);
+        free(priv->raster_pool);
+        priv->raster_pool = NULL;
+    }
+    priv->n_threads = 0;
+}
+
+// Resolve the requested thread count and (re)build the worker pool and the
+// per-worker render contexts. On any allocation failure, falls back to serial
+// rendering (pool == NULL, using priv->state). Must run between frames.
+void ass_renderer_update_pool(ASS_Renderer *priv)
+{
+    int req = priv->settings.render_thread_count;
+    int n;
+    if (req == 1) {
+        n = 1;
+    } else if (req <= 0) {
+        // Auto: most frames have only a few simultaneous events, so extra
+        // workers just idle while costing a RenderContext each. Cap the
+        // auto count to keep memory bounded on many-core machines; an
+        // explicit request > 1 is honored verbatim.
+        n = (int) ass_get_cpu_count();
+        if (n > ASS_AUTO_THREAD_CAP)
+            n = ASS_AUTO_THREAD_CAP;
+    } else {
+        n = req;
+    }
+    if (n < 1)
+        n = 1;
+
+    // Already in the desired configuration?
+    if (n <= 1 ? !priv->pool : (priv->pool && priv->n_threads == n))
+        return;
+
+    destroy_render_pool(priv);
+    if (n <= 1)
+        return;  // serial path uses priv->state
+
+    priv->worker_ctx = calloc(n, sizeof(*priv->worker_ctx));
+    if (!priv->worker_ctx)
+        return;
+    int built = 0;
+    for (; built < n; built++) {
+        RenderContext *ctx = calloc(1, sizeof(*ctx));
+        if (!ctx || !render_context_init(ctx, priv)) {
+            free(ctx);
+            break;
+        }
+        priv->worker_ctx[built] = ctx;
+    }
+    priv->n_threads = built;
+    if (built < n) {
+        destroy_render_pool(priv);  // partial: drop everything, stay serial
+        return;
+    }
+
+    priv->raster_pool = calloc(n, sizeof(*priv->raster_pool));
+    if (!priv->raster_pool) {
+        destroy_render_pool(priv);
+        return;
+    }
+    for (int i = 0; i < n; i++)
+        ass_rasterizer_init(&priv->engine, &priv->raster_pool[i], RASTERIZER_PRECISION);
+
+    priv->pool = ass_thread_pool_create(n);
+    if (!priv->pool)
+        destroy_render_pool(priv);  // frees the n contexts, stays serial
+}
+#endif
+
 ASS_Renderer *ass_renderer_init(ASS_Library *library)
 {
     int error;
@@ -128,6 +225,15 @@ ASS_Renderer *ass_renderer_init(ASS_Library *library)
     priv->library = library;
     priv->ftlibrary = ft;
     // images_root and related stuff is zero-filled in calloc
+
+    if (ass_rmutex_init(&priv->font_lock) != 0) {
+        FT_Done_FreeType(ft);
+        free(priv);
+        priv = 0;
+        goto fail;
+    }
+
+    priv->settings.render_thread_count = 1;  // serial by default
 
     unsigned flags = ASS_CPU_FLAG_ALL;
 #if CONFIG_LARGE_TILES
@@ -180,6 +286,12 @@ void ass_renderer_done(ASS_Renderer *render_priv)
     ass_frame_unref(render_priv->images_root);
     ass_frame_unref(render_priv->prev_images_root);
 
+#if CONFIG_THREADS
+    // Tear down workers (and their render contexts) before the caches their
+    // shapers reference are destroyed.
+    destroy_render_pool(render_priv);
+#endif
+
     ass_cache_done(render_priv->cache.composite_cache);
     ass_cache_done(render_priv->cache.bitmap_cache);
     ass_cache_done(render_priv->cache.outline_cache);
@@ -195,6 +307,8 @@ void ass_renderer_done(ASS_Renderer *render_priv)
 
     render_context_done(&render_priv->state);
 
+    ass_rmutex_destroy(&render_priv->font_lock);
+
     free(render_priv->settings.default_font);
     free(render_priv->settings.default_family);
 
@@ -209,7 +323,7 @@ void ass_renderer_done(ASS_Renderer *render_priv)
  */
 static ASS_Image *my_draw_bitmap(unsigned char *bitmap, int bitmap_w,
                                  int bitmap_h, int stride, int dst_x,
-                                 int dst_y, uint32_t color,
+                                 int dst_y, uint32_t color, unsigned type,
                                  CompositeHashValue *source)
 {
     ASS_ImagePriv *img = malloc(sizeof(ASS_ImagePriv));
@@ -226,6 +340,16 @@ static ASS_Image *my_draw_bitmap(unsigned char *bitmap, int bitmap_w,
     img->result.color = color;
     img->result.dst_x = dst_x;
     img->result.dst_y = dst_y;
+    img->result.type = type;
+    // Deferred blur applies to outline/shadow always, but to the fill only when
+    // libass actually blurred it (it doesn't, for a non-zero border).
+    if (source && !(type == IMAGE_TYPE_CHARACTER && !source->fill_blurred)) {
+        img->result.blur_x = source->blur_x;
+        img->result.blur_y = source->blur_y;
+    } else {
+        img->result.blur_x = 0.0;
+        img->result.blur_y = 0.0;
+    }
 
     img->source = source;
     ass_cache_inc_ref(source);
@@ -388,9 +512,8 @@ static ASS_Image **render_glyph_i(RenderContext *state,
             if (lbrk > r[j].x1) lbrk = r[j].x1;
             img = my_draw_bitmap(bm->buffer + r[j].y0 * bm->stride + r[j].x0,
                                  lbrk - r[j].x0, r[j].y1 - r[j].y0, bm->stride,
-                                 dst_x + r[j].x0, dst_y + r[j].y0, color, source);
+                                 dst_x + r[j].x0, dst_y + r[j].y0, color, type, source);
             if (!img) break;
-            img->type = type;
             *tail = img;
             tail = &img->next;
         }
@@ -398,9 +521,8 @@ static ASS_Image **render_glyph_i(RenderContext *state,
             if (lbrk < r[j].x0) lbrk = r[j].x0;
             img = my_draw_bitmap(bm->buffer + r[j].y0 * bm->stride + lbrk,
                                  r[j].x1 - lbrk, r[j].y1 - r[j].y0, bm->stride,
-                                 dst_x + lbrk, dst_y + r[j].y0, color2, source);
+                                 dst_x + lbrk, dst_y + r[j].y0, color2, type, source);
             if (!img) break;
-            img->type = type;
             *tail = img;
             tail = &img->next;
         }
@@ -475,9 +597,8 @@ render_glyph(RenderContext *state, Bitmap *bm, int dst_x, int dst_y,
             brk = b_x1;
         img = my_draw_bitmap(bm->buffer + bm->stride * b_y0 + b_x0,
                              brk - b_x0, b_y1 - b_y0, bm->stride,
-                             dst_x + b_x0, dst_y + b_y0, color, source);
+                             dst_x + b_x0, dst_y + b_y0, color, type, source);
         if (!img) return tail;
-        img->type = type;
         *tail = img;
         tail = &img->next;
     }
@@ -486,9 +607,8 @@ render_glyph(RenderContext *state, Bitmap *bm, int dst_x, int dst_y,
             brk = b_x0;
         img = my_draw_bitmap(bm->buffer + bm->stride * b_y0 + brk,
                              b_x1 - brk, b_y1 - b_y0, bm->stride,
-                             dst_x + brk, dst_y + b_y0, color2, source);
+                             dst_x + brk, dst_y + b_y0, color2, type, source);
         if (!img) return tail;
-        img->type = type;
         *tail = img;
         tail = &img->next;
     }
@@ -725,7 +845,8 @@ static void blend_vector_clip(RenderContext *state, ASS_Image *head)
             !quantize_transform(m, &pos, NULL, true, &key))
         return;
 
-    Bitmap *clip_bm = ass_cache_get(render_priv->cache.bitmap_cache, &key, state);
+    Bitmap *clip_bm = ass_cache_get(render_priv->cache.bitmap_cache, &key,
+                                    &(BitmapConstructCtx){ state, &state->rasterizer });
     if (!clip_bm)
         return;
 
@@ -1242,16 +1363,22 @@ size_t ass_outline_construct(void *key, void *value, void *priv)
     case OUTLINE_GLYPH:
         {
             GlyphHashKey *k = &outline_key->u.glyph;
+            ass_rmutex_lock(k->font->lock);
             ass_face_set_size(k->font->faces[k->face_index], k->size);
             if (!ass_font_get_glyph(k->font, k->face_index, k->glyph_index,
-                                    render_priv->settings.hinting))
+                                    render_priv->settings.hinting)) {
+                ass_rmutex_unlock(k->font->lock);
                 return 1;
+            }
             if (!ass_get_glyph_outline(&v->outline[0], &v->advance,
                                        k->font->faces[k->face_index],
-                                       k->flags))
+                                       k->flags)) {
+                ass_rmutex_unlock(k->font->lock);
                 return 1;
+            }
             ass_font_get_asc_desc(k->font, k->face_index,
                                   &v->asc, &v->desc);
+            ass_rmutex_unlock(k->font->lock);
             break;
         }
     case OUTLINE_DRAWING:
@@ -1381,7 +1508,7 @@ static void calc_transform_matrix(RenderContext *state,
  * They are returned in info->bm (glyph), info->bm_o (outline).
  */
 static void
-get_bitmap_glyph(RenderContext *state, GlyphInfo *info,
+get_bitmap_glyph(RenderContext *state, RasterizerData *rst, GlyphInfo *info,
                  int32_t *leftmost_x,
                  ASS_Vector *pos, ASS_Vector *pos_o,
                  ASS_DVector *offset, bool first, int flags)
@@ -1409,7 +1536,8 @@ get_bitmap_glyph(RenderContext *state, GlyphInfo *info,
     if (!quantize_transform(m, pos, offset, first, &key))
         return;
 
-    info->bm = ass_cache_get(render_priv->cache.bitmap_cache, &key, state);
+    info->bm = ass_cache_get(render_priv->cache.bitmap_cache, &key,
+                             &(BitmapConstructCtx){ state, rst });
     if (!info->bm || !info->bm->buffer)
         info->bm = NULL;
 
@@ -1533,7 +1661,8 @@ get_bitmap_glyph(RenderContext *state, GlyphInfo *info,
             !quantize_transform(m, pos_o, offset, false, &key))
         return;
 
-    info->bm_o = ass_cache_get(render_priv->cache.bitmap_cache, &key, state);
+    info->bm_o = ass_cache_get(render_priv->cache.bitmap_cache, &key,
+                               &(BitmapConstructCtx){ state, rst });
     if (!info->bm_o || !info->bm_o->buffer) {
         info->bm_o = NULL;
         *pos_o = *pos;
@@ -1548,7 +1677,8 @@ static inline size_t outline_size(const ASS_Outline* outline)
 
 size_t ass_bitmap_construct(void *key, void *value, void *priv)
 {
-    RenderContext *state = priv;
+    BitmapConstructCtx *ctx = priv;
+    RenderContext *state = ctx->state;
     BitmapHashKey *k = key;
     Bitmap *bm = value;
 
@@ -1564,7 +1694,7 @@ size_t ass_bitmap_construct(void *key, void *value, void *priv)
         ass_outline_transform_2d(&outline[1], &k->outline->outline[1], m);
     }
 
-    if (!ass_outline_to_bitmap(state, bm, &outline[0], &outline[1]))
+    if (!ass_outline_to_bitmap(state, ctx->rst, bm, &outline[0], &outline[1]))
         memset(bm, 0, sizeof(*bm));
     ass_outline_free(&outline[0]);
     ass_outline_free(&outline[1]);
@@ -2444,6 +2574,35 @@ static double restore_blur(int qblur)
 }
 
 // Convert glyphs to bitmaps, combine them, apply blur, generate shadows.
+// A glyph whose raster was deferred out of the serial run-walk (see
+// render_and_combine_glyphs). pos/pos_o are filled in by the raster.
+struct raster_item {
+    GlyphInfo *gi;
+    CombinedBitmapInfo *run;
+    int flags;
+    ASS_DVector offset;
+    ASS_Vector pos, pos_o;
+};
+
+#if CONFIG_THREADS
+struct raster_job {
+    RenderContext *state;
+    struct raster_item *items;
+};
+
+// Rasterize one deferred glyph on a worker thread, using that worker's own
+// rasterizer scratch (worker_id-indexed) and the shared, read-only event state.
+static void raster_task(void *arg, size_t index, size_t worker_id)
+{
+    struct raster_job *j = arg;
+    struct raster_item *it = &j->items[index];
+    RasterizerData *rst = &j->state->renderer->raster_pool[worker_id];
+    int32_t leftmost_x;  // unused: deferred glyphs are never karaoke \kf
+    get_bitmap_glyph(j->state, rst, it->gi, &leftmost_x,
+                     &it->pos, &it->pos_o, &it->offset, false, it->flags);
+}
+#endif
+
 static void render_and_combine_glyphs(RenderContext *state,
                                       double device_x, double device_y)
 {
@@ -2456,6 +2615,14 @@ static void render_and_combine_glyphs(RenderContext *state,
     CombinedBitmapInfo *combined_info = text_info->combined_bitmaps;
     CombinedBitmapInfo *current_info = NULL;
     ASS_DVector offset;
+
+    // Per-glyph rasterization is the hot cost. Within a run the origin `offset`
+    // is set once by the first contributing glyph and read-only afterwards, so
+    // the remaining glyphs are independent and get deferred into this list to be
+    // rasterized in parallel (pass B), then collected in order (pass C).
+    struct raster_item *items = NULL;
+    size_t n_items = 0, max_items = 0;
+
     for (int i = 0; i < text_info->length; i++) {
         GlyphInfo *info = text_info->glyphs + i;
         if (info->starts_new_run) new_run = true;
@@ -2542,8 +2709,28 @@ static void render_and_combine_glyphs(RenderContext *state,
             ASS_Vector pos, pos_o;
             info->pos.x = double_to_d6(device_x + d6_to_double(info->pos.x) * render_priv->par_scale_x);
             info->pos.y = double_to_d6(device_y) + info->pos.y;
-            get_bitmap_glyph(state, info, &current_info->leftmost_x, &pos, &pos_o,
-                             &offset, !current_info->bitmap_count, flags);
+
+            // Origin already established for this (non-karaoke) run -> defer the
+            // raster to pass B. (Karaoke \kf glyphs reduce a shared leftmost_x,
+            // so they must stay serial.)
+            if (current_info->bitmap_count &&
+                current_info->effect_type != EF_KARAOKE_KF) {
+                if (n_items >= max_items) {
+                    size_t ns = max_items ? 2 * max_items : 256;
+                    struct raster_item *ni = realloc(items, ns * sizeof(*ni));
+                    if (!ni)
+                        continue;
+                    items = ni;
+                    max_items = ns;
+                }
+                items[n_items++] = (struct raster_item){
+                    .gi = info, .run = current_info, .flags = flags, .offset = offset,
+                };
+                continue;
+            }
+
+            get_bitmap_glyph(state, &state->rasterizer, info, &current_info->leftmost_x,
+                             &pos, &pos_o, &offset, !current_info->bitmap_count, flags);
 
             if (!info->bm && !info->bm_o)
                 continue;
@@ -2565,6 +2752,44 @@ static void render_and_combine_glyphs(RenderContext *state,
             current_info->y = FFMIN(current_info->y, pos.y);
         }
     }
+
+    // Pass B: rasterize the deferred glyphs, in parallel across the worker pool
+    // (each uses its own rasterizer scratch). The cache is thread-safe and the
+    // event state is read-only here, so this is a plain non-exclusive fan-out.
+#if CONFIG_THREADS
+    if (render_priv->pool && n_items > 1) {
+        struct raster_job job = { state, items };
+        ass_thread_pool_run(render_priv->pool, n_items, raster_task, &job, false);
+    } else
+#endif
+    for (size_t k = 0; k < n_items; k++) {
+        int32_t leftmost_x;
+        get_bitmap_glyph(state, &state->rasterizer, items[k].gi, &leftmost_x,
+                         &items[k].pos, &items[k].pos_o, &items[k].offset, false,
+                         items[k].flags);
+    }
+
+    // Pass C: collect the deferred glyphs into their runs, in original order.
+    for (size_t k = 0; k < n_items; k++) {
+        GlyphInfo *gi = items[k].gi;
+        CombinedBitmapInfo *ci = items[k].run;
+        if (!gi->bm && !gi->bm_o)
+            continue;
+        if (ci->bitmap_count >= ci->max_bitmap_count) {
+            size_t new_size = 2 * ci->max_bitmap_count;
+            if (!ASS_REALLOC_ARRAY(ci->bitmaps, new_size))
+                continue;
+            ci->max_bitmap_count = new_size;
+        }
+        ci->bitmaps[ci->bitmap_count].bm   = gi->bm;
+        ci->bitmaps[ci->bitmap_count].bm_o = gi->bm_o;
+        ci->bitmaps[ci->bitmap_count].pos   = items[k].pos;
+        ci->bitmaps[ci->bitmap_count].pos_o = items[k].pos_o;
+        ci->bitmap_count++;
+        ci->x = FFMIN(ci->x, items[k].pos.x);
+        ci->y = FFMIN(ci->y, items[k].pos.y);
+    }
+    free(items);
 
     for (int i = 0; i < nb_bitmaps; i++) {
         CombinedBitmapInfo *info = &combined_info[i];
@@ -2640,6 +2865,74 @@ int ass_be_padding(int be)
 }
 
 
+#if CONFIG_THREADS
+struct combine_job {
+    const BitmapEngine *engine;
+    Bitmap *dst;
+    BitmapRef *bitmaps;
+    int count;
+    int nbands;
+    bool outline;
+};
+
+// Add every source bitmap's rows that fall in this output band. Bands are
+// disjoint row ranges of dst, so tasks never touch the same pixel.
+static void combine_band(void *arg, size_t band, size_t worker_id)
+{
+    struct combine_job *j = arg;
+    Bitmap *dst = j->dst;
+    int y0 = (int)((long long) band       * dst->h / j->nbands);
+    int y1 = (int)((long long)(band + 1)  * dst->h / j->nbands);
+    for (int i = 0; i < j->count; i++) {
+        Bitmap *src = j->outline ? j->bitmaps[i].bm_o : j->bitmaps[i].bm;
+        if (!src)
+            continue;
+        ASS_Vector pos = j->outline ? j->bitmaps[i].pos_o : j->bitmaps[i].pos;
+        int x = pos.x + src->left - dst->left;
+        int y = pos.y + src->top  - dst->top;
+        int r0 = y > y0 ? y : y0;
+        int r1 = y + src->h < y1 ? y + src->h : y1;
+        if (r1 <= r0)
+            continue;
+        unsigned char *buf = dst->buffer + (ptrdiff_t) r0 * dst->stride + x;
+        j->engine->add_bitmaps(buf, dst->stride,
+                               src->buffer + (ptrdiff_t)(r0 - y) * src->stride,
+                               src->stride, src->w, r1 - r0);
+    }
+}
+#endif
+
+// Combine all source fill (outline=false) or border (outline=true) bitmaps into
+// dst. For large composites this is the serial floor on a heavy single-run
+// event, so band it across the worker pool; bit-exact with the serial add.
+static void combine_bitmaps(ASS_Renderer *render_priv, Bitmap *dst,
+                            BitmapRef *bitmaps, int count, bool outline)
+{
+#if CONFIG_THREADS
+    if (render_priv->pool && dst->h >= 16 && (long long) dst->h * count >= 4096) {
+        int nbands = render_priv->n_threads;
+        if (nbands > dst->h)
+            nbands = dst->h;
+        struct combine_job job = {
+            &render_priv->engine, dst, bitmaps, count, nbands, outline,
+        };
+        ass_thread_pool_run(render_priv->pool, nbands, combine_band, &job, false);
+        return;
+    }
+#endif
+    for (int i = 0; i < count; i++) {
+        Bitmap *src = outline ? bitmaps[i].bm_o : bitmaps[i].bm;
+        if (!src)
+            continue;
+        ASS_Vector pos = outline ? bitmaps[i].pos_o : bitmaps[i].pos;
+        int x = pos.x + src->left - dst->left;
+        int y = pos.y + src->top  - dst->top;
+        unsigned char *buf = dst->buffer + (ptrdiff_t) y * dst->stride + x;
+        render_priv->engine.add_bitmaps(buf, dst->stride,
+                                        src->buffer, src->stride, src->w, src->h);
+    }
+}
+
 size_t ass_composite_construct(void *key, void *value, void *priv)
 {
     ASS_Renderer *render_priv = priv;
@@ -2679,19 +2972,7 @@ size_t ass_composite_construct(void *key, void *value, void *priv)
         Bitmap *dst = &v->bm;
         dst->left = rect.x_min - bord;
         dst->top  = rect.y_min - bord;
-        for (int i = 0; i < k->bitmap_count; i++) {
-            Bitmap *src = k->bitmaps[i].bm;
-            if (!src)
-                continue;
-            int x = k->bitmaps[i].pos.x + src->left - dst->left;
-            int y = k->bitmaps[i].pos.y + src->top  - dst->top;
-            assert(x >= 0 && x + src->w <= dst->w);
-            assert(y >= 0 && y + src->h <= dst->h);
-            unsigned char *buf = dst->buffer + y * dst->stride + x;
-            render_priv->engine.add_bitmaps(buf, dst->stride,
-                                            src->buffer, src->stride,
-                                            src->w, src->h);
-        }
+        combine_bitmaps(render_priv, dst, k->bitmaps, k->bitmap_count, false);
     }
     if (!bord && n_bm_o == 1) {
         ass_copy_bitmap(&render_priv->engine, &v->bm_o, last_o->bm_o);
@@ -2704,27 +2985,36 @@ size_t ass_composite_construct(void *key, void *value, void *priv)
         Bitmap *dst = &v->bm_o;
         dst->left = rect_o.x_min - bord;
         dst->top  = rect_o.y_min - bord;
-        for (int i = 0; i < k->bitmap_count; i++) {
-            Bitmap *src = k->bitmaps[i].bm_o;
-            if (!src)
-                continue;
-            int x = k->bitmaps[i].pos_o.x + src->left - dst->left;
-            int y = k->bitmaps[i].pos_o.y + src->top  - dst->top;
-            assert(x >= 0 && x + src->w <= dst->w);
-            assert(y >= 0 && y + src->h <= dst->h);
-            unsigned char *buf = dst->buffer + y * dst->stride + x;
-            render_priv->engine.add_bitmaps(buf, dst->stride,
-                                            src->buffer, src->stride,
-                                            src->w, src->h);
-        }
+        combine_bitmaps(render_priv, dst, k->bitmaps, k->bitmap_count, true);
     }
 
     int flags = k->filter.flags;
     double r2x = restore_blur(k->filter.blur_x);
     double r2y = restore_blur(k->filter.blur_y);
-    if (!(flags & FILTER_NONZERO_BORDER) || (flags & FILTER_BORDER_STYLE_3))
-        ass_synth_blur(&render_priv->engine, &v->bm, k->filter.be, r2x, r2y);
-    ass_synth_blur(&render_priv->engine, &v->bm_o, k->filter.be, r2x, r2y);
+#if CONFIG_THREADS
+    void *blur_pool = render_priv->pool;
+#else
+    void *blur_pool = NULL;
+#endif
+    bool blur_bm = !(flags & FILTER_NONZERO_BORDER) || (flags & FILTER_BORDER_STYLE_3);
+    if (render_priv->blur_deferred) {
+        // Don't convolve: just expand the bitmaps to the bounds the blur would
+        // produce, and record the gaussian std-dev so a downstream consumer
+        // (e.g. the GPU) can apply it. NOTE (spike): box blur (\be) is not
+        // deferred; gaussian \blur only.
+        if (r2x > 0.001 || r2y > 0.001) {
+            if (blur_bm)
+                ass_blur_expand_only(&render_priv->engine, &v->bm, r2x, r2y);
+            ass_blur_expand_only(&render_priv->engine, &v->bm_o, r2x, r2y);
+        }
+        v->blur_x = r2x > 0.001 ? sqrt(r2x) : 0.0;
+        v->blur_y = r2y > 0.001 ? sqrt(r2y) : 0.0;
+        v->fill_blurred = blur_bm;
+    } else {
+        if (blur_bm)
+            ass_synth_blur(&render_priv->engine, blur_pool, &v->bm, k->filter.be, r2x, r2y);
+        ass_synth_blur(&render_priv->engine, blur_pool, &v->bm_o, k->filter.be, r2x, r2y);
+    }
 
     if (!(flags & FILTER_FILL_IN_BORDER) && !(flags & FILTER_FILL_IN_SHADOW))
         ass_fix_outline(&v->bm, &v->bm_o);
@@ -2782,7 +3072,7 @@ static void add_background(RenderContext *state, EventImages *event_images)
     uint32_t clr = state->c[3];
     ass_apply_fade(&clr, state->fade);
     ASS_Image *img = my_draw_bitmap(nbuffer, w, h, w, left, top,
-                                    clr, NULL);
+                                    clr, IMAGE_TYPE_CHARACTER, NULL);
     if (img) {
         img->next = event_images->imgs;
         event_images->imgs = img;
@@ -3072,6 +3362,12 @@ ass_start_frame(ASS_Renderer *render_priv, ASS_Track *track,
     }
 
     setup_shaper(render_priv->state.shaper, render_priv);
+#if CONFIG_THREADS
+    // Worker contexts have their own shapers; configure them identically.
+    if (render_priv->pool)
+        for (int i = 0; i < render_priv->n_threads; i++)
+            setup_shaper(render_priv->worker_ctx[i]->shaper, render_priv);
+#endif
 
     // PAR correction
     double par = render_priv->settings.par;
@@ -3358,6 +3654,76 @@ static ASS_Image *ass_free_image(ASS_Image *img) {
     return next;
 }
 
+#if CONFIG_THREADS
+struct render_job {
+    RenderContext **ctx;
+    ASS_Event **events;
+    EventImages *out;
+    char *kept;
+};
+
+static void render_one_event(void *arg, size_t i, size_t worker_id)
+{
+    struct render_job *j = arg;
+    j->kept[i] = ass_render_event(j->ctx[worker_id], j->events[i], &j->out[i]) ? 1 : 0;
+}
+
+// Render all events active at `now` across the worker pool, compacting the
+// kept results into priv->eimg in event order. Returns the kept count, or -1
+// on allocation failure (caller falls back to serial rendering).
+static int render_events_parallel(ASS_Renderer *priv, ASS_Track *track,
+                                  long long now)
+{
+    int n_active = 0;
+    for (int i = 0; i < track->n_events; i++) {
+        ASS_Event *e = track->events + i;
+        if (e->Start <= now && now < e->Start + e->Duration)
+            n_active++;
+    }
+    if (n_active == 0)
+        return 0;
+
+    if (n_active > priv->eimg_size) {
+        EventImages *tmp = realloc(priv->eimg, n_active * sizeof(EventImages));
+        if (!tmp)
+            return -1;
+        priv->eimg = tmp;
+        priv->eimg_size = n_active;
+    }
+
+    ASS_Event **events = malloc(n_active * sizeof(*events));
+    char *kept = malloc(n_active);
+    if (!events || !kept) {
+        free(events);
+        free(kept);
+        return -1;
+    }
+
+    int k = 0;
+    for (int i = 0; i < track->n_events; i++) {
+        ASS_Event *e = track->events + i;
+        if (e->Start <= now && now < e->Start + e->Duration)
+            events[k++] = e;
+    }
+
+    struct render_job job = { priv->worker_ctx, events, priv->eimg, kept };
+    ass_thread_pool_run(priv->pool, n_active, render_one_event, &job, true);
+
+    int cnt = 0;
+    for (int i = 0; i < n_active; i++) {
+        if (kept[i]) {
+            if (i != cnt)
+                priv->eimg[cnt] = priv->eimg[i];
+            cnt++;
+        }
+    }
+
+    free(events);
+    free(kept);
+    return cnt;
+}
+#endif
+
 /**
  * \brief render a frame
  * \param priv library handle
@@ -3379,6 +3745,12 @@ ASS_Image *ass_render_frame(ASS_Renderer *priv, ASS_Track *track,
 
     // render events separately
     int cnt = 0;
+#if CONFIG_THREADS
+    int pcnt = priv->pool ? render_events_parallel(priv, track, now) : -1;
+    if (pcnt >= 0)
+        cnt = pcnt;
+    else
+#endif
     for (int i = 0; i < track->n_events; i++) {
         ASS_Event *event = track->events + i;
         if ((event->Start <= now)
@@ -3450,7 +3822,7 @@ void ass_frame_ref(ASS_Image *img)
 {
     if (!img)
         return;
-    ((ASS_ImagePriv *) img)->ref_count++;
+    ass_atomic_inc_size(&((ASS_ImagePriv *) img)->ref_count);
 }
 
 /**
@@ -3459,7 +3831,7 @@ void ass_frame_ref(ASS_Image *img)
  */
 void ass_frame_unref(ASS_Image *img)
 {
-    if (!img || --((ASS_ImagePriv *) img)->ref_count)
+    if (!img || ass_atomic_dec_size(&((ASS_ImagePriv *) img)->ref_count))
         return;
     do {
         img = ass_free_image(img);
