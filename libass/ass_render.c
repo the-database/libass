@@ -351,12 +351,108 @@ static ASS_Image *my_draw_bitmap(unsigned char *bitmap, int bitmap_w,
         img->result.blur_y = 0.0;
     }
 
+    // Combined (legacy / blur-deferred) images are not per-glyph: a downstream
+    // GPU compositor must route them the normal way, so zero the glyph fields.
+    img->result.glyph_id = 0;
+    img->result.run_id = 0;
+    img->result.run_flags = 0;
+
     img->source = source;
     ass_cache_inc_ref(source);
     img->buffer = source ? NULL : bitmap;
     img->ref_count = 0;
 
     return &img->result;
+}
+
+static double restore_blur(int qblur);   // defined with the compositor below
+
+// True when the current event may be emitted as uncombined per-glyph bitmaps
+// for a downstream GPU compositor (composite-deferred mode): no clip, no opaque
+// box. Per-run shadow/karaoke exclusions are applied in render_and_combine_glyphs.
+static bool composite_deferrable(RenderContext *state)
+{
+    ASS_Renderer *render_priv = state->renderer;
+    if (!render_priv->composite_deferred)
+        return false;
+    if (state->clip_drawing_text.str)   // vector \clip / \iclip
+        return false;
+    if (state->clip_mode)               // inverse rectangular clip
+        return false;
+    if (state->border_style == 4)       // opaque box background
+        return false;
+    if (state->clip_x0 > 0 || state->clip_y0 > 0 ||
+        state->clip_x1 < render_priv->width || state->clip_y1 < render_priv->height)
+        return false;                   // rectangular \clip narrower than frame
+    return true;
+}
+
+// Emit one uncombined per-glyph coverage bitmap as an ASS_Image. The glyph
+// Bitmap is owned by the bitmap cache; we pin it with a ref (released when the
+// image is freed -- ass_free_image only ref-counts img->source, never reads it).
+static ASS_Image *my_draw_glyph(Bitmap *bm, int dst_x, int dst_y,
+                                uint32_t color, unsigned type,
+                                double blur_x, double blur_y,
+                                uint32_t run_id, uint32_t run_flags)
+{
+    ASS_ImagePriv *img = malloc(sizeof(ASS_ImagePriv));
+    if (!img)
+        return NULL;
+    img->result.w = bm->w;
+    img->result.h = bm->h;
+    img->result.stride = bm->stride;
+    img->result.bitmap = bm->buffer;
+    img->result.color = color;
+    img->result.dst_x = dst_x + bm->left;
+    img->result.dst_y = dst_y + bm->top;
+    img->result.type = type;
+    img->result.blur_x = blur_x;
+    img->result.blur_y = blur_y;
+    img->result.glyph_id = bm->cache_id;   // stable per cached glyph (Stage B cache)
+    img->result.run_id = run_id;
+    img->result.run_flags = run_flags;
+    img->source = (CompositeHashValue *) bm;
+    ass_cache_inc_ref(bm);
+    img->buffer = NULL;
+    img->ref_count = 0;
+    return &img->result;
+}
+
+// Emit the glyphs of a deferred run for one coverage layer (outline bm_o or
+// fill bm), in the run's order. Returns the new image-list tail.
+static ASS_Image **render_run_deferred(CombinedBitmapInfo *info, bool outline,
+                                       uint32_t run_id, ASS_Image **tail)
+{
+    // Clean run_flags ABI for the GPU consumer: bit 0 = apply fix_outline
+    // (subtract fill from border), matching ass_composite_construct's gate.
+    // Deferred runs never carry a shadow, so only FILL_IN_BORDER matters.
+    uint32_t flags = (info->filter.flags & FILTER_FILL_IN_BORDER) ? 0 : 1;
+    uint32_t color = outline ? info->c[2] : info->c[0];
+    unsigned type = outline ? IMAGE_TYPE_OUTLINE : IMAGE_TYPE_CHARACTER;
+    double bx = restore_blur(info->filter.blur_x);
+    double by = restore_blur(info->filter.blur_y);
+    bx = bx > 0.001 ? sqrt(bx) : 0.0;
+    by = by > 0.001 ? sqrt(by) : 0.0;
+    // The fill is only blurred when there's no (nonzero) border, matching
+    // ass_composite_construct's blur_bm; the border is always blurred.
+    bool blur_fill = !(info->filter.flags & FILTER_NONZERO_BORDER) ||
+                     (info->filter.flags & FILTER_BORDER_STYLE_3);
+    if (!outline && !blur_fill)
+        bx = by = 0.0;
+    for (size_t j = 0; j < info->bitmap_count; j++) {
+        BitmapRef *ref = &info->bitmaps[j];
+        Bitmap *bm = outline ? ref->bm_o : ref->bm;
+        if (!bm || !bm->buffer)
+            continue;
+        ASS_Vector pos = outline ? ref->pos_o : ref->pos;
+        ASS_Image *im = my_draw_glyph(bm, info->x + pos.x, info->y + pos.y,
+                                      color, type, bx, by, run_id, flags);
+        if (im) {
+            *tail = im;
+            tail = &im->next;
+        }
+    }
+    return tail;
 }
 
 /**
@@ -957,6 +1053,10 @@ static ASS_Image *render_text(RenderContext *state)
 
     for (unsigned i = 0; i < n_bitmaps; i++) {
         CombinedBitmapInfo *info = &bitmaps[i];
+        if (info->deferred) {
+            tail = render_run_deferred(info, true, i + 1, tail);
+            continue;
+        }
         if (!info->bm_o)
             continue;
 
@@ -972,6 +1072,12 @@ static ASS_Image *render_text(RenderContext *state)
 
     for (unsigned i = 0; i < n_bitmaps; i++) {
         CombinedBitmapInfo *info = &bitmaps[i];
+        if (info->deferred) {
+            tail = render_run_deferred(info, false, i + 1, tail);
+            free(info->bitmaps);    // owned by us in deferred mode (no combine)
+            info->bitmaps = NULL;
+            continue;
+        }
         if (!info->bm)
             continue;
 
@@ -1698,6 +1804,11 @@ size_t ass_bitmap_construct(void *key, void *value, void *priv)
         memset(bm, 0, sizeof(*bm));
     ass_outline_free(&outline[0]);
     ass_outline_free(&outline[1]);
+
+    // Stable, collision-free id for the deferred-composite GPU glyph cache: a
+    // new cache entry gets a fresh id, a reused one keeps it (motion-invariant).
+    static ass_atomic_size_t bitmap_id_counter;
+    bm->cache_id = ass_atomic_inc_size(&bitmap_id_counter);
 
     return sizeof(BitmapHashKey) + sizeof(Bitmap) + bitmap_size(bm) +
            sizeof(OutlineHashValue) + outline_size(&k->outline->outline[0]) + outline_size(&k->outline->outline[1]);
@@ -2792,10 +2903,14 @@ static void render_and_combine_glyphs(RenderContext *state,
     }
     free(items);
 
+    bool deferrable = composite_deferrable(state);
+
     for (int i = 0; i < nb_bitmaps; i++) {
         CombinedBitmapInfo *info = &combined_info[i];
+        info->deferred = false;
         if (!info->bitmap_count) {
             free(info->bitmaps);
+            info->bitmaps = NULL;
             continue;
         }
 
@@ -2808,6 +2923,15 @@ static void render_and_combine_glyphs(RenderContext *state,
             info->bitmaps[j].pos.y -= info->y;
             info->bitmaps[j].pos_o.x -= info->x;
             info->bitmaps[j].pos_o.y -= info->y;
+        }
+
+        // Composite-deferred runs (no shadow, no karaoke) skip the CPU combine
+        // and keep their per-glyph bitmaps for per-glyph emission in render_text;
+        // the GPU consumer combines them. Shadow/karaoke runs fall back here.
+        if (deferrable && info->effect_type == EF_NONE &&
+            !(info->filter.flags & FILTER_NONZERO_SHADOW)) {
+            info->deferred = true;
+            continue;
         }
 
         CompositeHashKey key;

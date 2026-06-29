@@ -90,6 +90,21 @@ typedef struct ass_image {
     // in the default mode). The bitmap bounds (w/h) are already expanded to
     // hold the blurred result.
     double blur_x, blur_y;
+
+    // Deferred-composite mode (ass_set_composite_deferred): this image is a
+    // single uncombined per-glyph coverage bitmap, to be combined + composited
+    // by a downstream GPU consumer instead of on the CPU.
+    //   glyph_id  - stable cache id for the coverage bitmap, identical across
+    //               frames where only the glyph's position changes (motion).
+    //               0 means "not a deferred-composite glyph": composite this
+    //               image the legacy way (e.g. events using a vector \clip).
+    //   run_id    - images sharing a run are coverage-combined (saturating add)
+    //               before being alpha-over composited with the run color;
+    //               images of different runs are composited independently.
+    //   run_flags - the run's FilterDesc flags (fix_outline / shadow gating).
+    uint64_t glyph_id;
+    uint32_t run_id;
+    uint32_t run_flags;
 } ASS_Image;
 
 /*
@@ -442,6 +457,28 @@ void ass_set_storage_size(ASS_Renderer *priv, int w, int h);
  * \param deferred 0 to disable (default), non-zero to enable
  */
 void ass_set_blur_deferred(ASS_Renderer *priv, int deferred);
+
+/**
+ * \brief Defer subtitle compositing to the caller (GPU), not just the blur.
+ *
+ * When enabled, libass stops combining a run's glyphs into a single coverage
+ * bitmap on the CPU. Instead each rendered ASS_Image is a single *uncombined*
+ * per-glyph coverage bitmap tagged with a stable ASS_Image.glyph_id (identical
+ * across frames where only the position changes), an ASS_Image.run_id (glyphs
+ * to coverage-combine before alpha-over), and ASS_Image.run_flags. A downstream
+ * consumer caches each glyph once and performs the combine + blur + fix_outline
+ * + shadow + alpha-over on the GPU, avoiding the per-frame CPU compositing and
+ * its large memory-bandwidth cost.
+ *
+ * Implies deferred blur (the blur runs on the combined run coverage downstream).
+ * Events using a vector \clip fall back to legacy combined output (glyph_id 0).
+ *
+ * Default: off.
+ *
+ * \param priv renderer handle
+ * \param deferred 0 to disable (default), non-zero to enable
+ */
+void ass_set_composite_deferred(ASS_Renderer *priv, int deferred);
 
 /**
  * \brief Set shaping level. This is merely a hint, the renderer will use

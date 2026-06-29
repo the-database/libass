@@ -124,6 +124,7 @@ typedef struct {
     int x, y;
     Bitmap *bm, *bm_o, *bm_s;   // glyphs, outline, shadow bitmaps
     CompositeHashValue *image;
+    bool deferred;              // composite-deferred: emit per-glyph, no combine
 } CombinedBitmapInfo;
 
 typedef struct {
@@ -325,6 +326,7 @@ struct ass_renderer {
     ASS_Settings settings;
     int render_id;
     bool blur_deferred;         // emit unblurred coverage + ASS_Image.blur_x/y
+    bool composite_deferred;    // emit uncombined per-glyph images (implies blur_deferred)
 
     ASS_Image *images_root;     // rendering result is stored here
     ASS_Image *prev_images_root;
