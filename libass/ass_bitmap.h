@@ -36,8 +36,9 @@ typedef struct {
     ptrdiff_t stride;
     uint8_t *buffer;      // h * stride buffer (NULL in outline-deferred mode)
     uint64_t cache_id;    // unique per cached glyph bitmap (deferred-composite id)
-    int32_t *segments;    // outline-deferred: line endpoints (4*int32 each, 1/64px,
-    int32_t n_segments;   //   rebased to (left,top)); GPU rasterizes these
+    int32_t *segments;    // outline-deferred: the packed per-tile GPU blob
+    int32_t n_segments;   //   [n_tiles, n_segs, tiles.., segs..] (int32 count;
+                          //   see ASS_Image.outline in ass.h). NULL/0 otherwise.
 } Bitmap;
 
 bool ass_alloc_bitmap(const BitmapEngine *engine, Bitmap *bm, int32_t w, int32_t h, bool zero);

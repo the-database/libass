@@ -107,10 +107,42 @@ typedef struct ass_image {
     uint32_t run_flags;
 
     // Deferred-outline mode (ass_set_outline_deferred): instead of a rasterized
-    // coverage bitmap (bitmap == NULL), this image carries the glyph's flattened,
-    // transformed coverage outline for a GPU rasterizer. `outline` points to
-    // n_outline*4 int32 values (x0,y0,x1,y1 per line segment) in 1/64 px,
-    // relative to (dst_x, dst_y). w/h is the coverage bounding box.
+    // coverage bitmap (bitmap == NULL), this image carries the glyph's coverage
+    // pre-split into 16x16-pixel tiles for a per-tile GPU filler. `outline`
+    // points to `n_outline` int32 values; floats in the tile/seg records are
+    // stored bit-for-bit (reinterpret the int32 as a float). w/h is the coverage
+    // bounding box in pixels and every coordinate below is relative to its
+    // origin (dst_x, dst_y). Layout (see ass_outline_to_tiles in
+    // ass_rasterizer.c, which produces it):
+    //
+    //   outline[0] = n_tiles  (> 0)
+    //   outline[1] = n_segs   (> 0)
+    //   outline[2 ..]                     n_tiles tile records, 11 int32 each
+    //   outline[2 + n_tiles*11 ..]        n_segs  seg  records,  8 int32 each
+    //   n_outline  = 2 + n_tiles*11 + n_segs*8
+    //
+    // Tile record (11 fields; #2 int, the rest as noted):
+    //   [0] tx, [1] ty : tile origin in pixels within the coverage bbox
+    //                    (multiples of 16; floats).
+    //   [2] ng         : number of groups, 1 or 2 (int32). Two groups are
+    //                    per-pixel max-merged to reproduce stroke self-overlap.
+    //   [3..6]  group 0 : { type, winding, seg_off, seg_cnt } (floats)
+    //   [7..10] group 1 : same, present iff ng == 2 (else zero-filled)
+    // Group fields:
+    //   type    : 0 = solid, 1 = single half-plane, 2 = generic (>=1 segments)
+    //   winding : solid -> 1 filled / 0 empty; generic -> entering winding count
+    //             at the tile's bottom-left corner (signed); half-plane -> 0
+    //   seg_off : index of the group's first seg in the seg pool (0 if solid)
+    //   seg_cnt : segment count (0 solid, 1 half-plane, N generic)
+    //
+    // Seg record (8 fields, all floats):
+    //   [0] a, [1] b, [2] c : half-plane line coefficients, pre-rescaled exactly
+    //                         as libass's CPU tile filler consumes them
+    //   [3] flags           : SEGFLAG_* bits for the generic filler (0 for the
+    //                         lone half-plane-group segment)
+    //   [4] x_min, [5] y_min, [6] y_max : tile-relative segment bounds in pixels
+    //                         for the generic filler (0 for a half-plane segment)
+    //   [7] unused (0)
     int32_t *outline;
     int32_t n_outline;
 
