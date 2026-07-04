@@ -23,7 +23,14 @@
  *       $BUILD/libass/libass.a $(pkg-config --cflags --libs freetype2 \
  *       harfbuzz fribidi fontconfig) -lm -lpthread -o int8k_harness
  *
- * Usage: int8k_harness [-t threads] [-m hash|outline] [-W w] [-H h] dir...
+ *   blurdefer mode (-m blurdefer):
+ *       self-contained fix check for ass_set_blur_deferred: renders a \be2-only
+ *       event and asserts the deferred bitmap matches the non-deferred render
+ *       with blur_x==blur_y==0, plus a \be2\blur3 event asserting the gaussian
+ *       is deferred (blur_x/y>0) and \be is still applied. Needs a font dir
+ *       only (for "Aileron"); the .ass corpus is ignored.
+ *
+ * Usage: int8k_harness [-t threads] [-m hash|outline|blurdefer] [-W w] [-H h] dir...
  */
 
 #include <dirent.h>
@@ -228,11 +235,98 @@ static int run_outline(ASS_Renderer *r, ASS_Track *track, const char *name)
 }
 #endif
 
+/* --- blur-deferred mode (verifies the \be fix in blur-deferred-only mode) --
+ *
+ * ass_set_blur_deferred(1) defers ONLY the gaussian \blur (recorded as
+ * ASS_Image.blur_x/blur_y); the box blur \be must still be applied on the CPU.
+ * Self-contained: builds one borderless white event in memory, so it needs no
+ * .ass corpus -- only a font dir (for "Aileron") on the command line. */
+
+static const char *BLURDEFER_TEMPLATE =
+    "[Script Info]\n"
+    "PlayResX: 1280\nPlayResY: 720\nScaledBorderAndShadow: yes\n\n"
+    "[V4+ Styles]\n"
+    "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+    "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, "
+    "ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, "
+    "MarginR, MarginV, Encoding\n"
+    "Style: T,Aileron,72,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,"
+    "100,100,0,0,1,0,0,5,10,10,10,1\n\n"
+    "[Events]\n"
+    "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, "
+    "Text\n"
+    "Dialogue: 0,0:00:00.00,0:00:10.00,T,,0,0,0,,{%s}Blur Wg\n";
+
+/* Render the one-event track built from `override` at t=1000ms with the given
+ * blur_deferred setting; returns the blended-canvas hash and reports the max
+ * emitted blur_x/blur_y over the image chain. */
+static uint64_t blurdefer_render(ASS_Renderer *r, int fw, int fh,
+                                 const char *override, int deferred,
+                                 double *max_bx, double *max_by)
+{
+    char doc[1024];
+    int n = snprintf(doc, sizeof(doc), BLURDEFER_TEMPLATE, override);
+    ASS_Track *track = ass_read_memory(g_lib, doc, (size_t) n, NULL);
+    if (!track) {
+        fprintf(stderr, "blurdefer: ass_read_memory failed\n");
+        exit(1);
+    }
+    ass_set_blur_deferred(r, deferred);
+    ASS_Image *img = ass_render_frame(r, track, 1000, NULL);
+    uint8_t *canvas = calloc(1, (size_t) 4 * fw * fh);
+    double bx = 0, by = 0;
+    for (ASS_Image *im = img; im; im = im->next) {
+        if (im->blur_x > bx) bx = im->blur_x;
+        if (im->blur_y > by) by = im->blur_y;
+        blend_image(canvas, fw, fh, im);
+    }
+    uint64_t h = fnv1a64(canvas, (size_t) 4 * fw * fh);
+    free(canvas);
+    ass_free_track(track);
+    if (max_bx) *max_bx = bx;
+    if (max_by) *max_by = by;
+    return h;
+}
+
+static int run_blurdefer(ASS_Renderer *r, int fw, int fh)
+{
+    int fails = 0;
+    double bx, by, bx2, by2;
+
+    /* Case 1 (\be only): the deferred render must match the non-deferred render
+     * bit-for-bit -- the box blur is applied on the CPU in both -- and no
+     * gaussian may be deferred (blur_x == blur_y == 0). */
+    uint64_t ref = blurdefer_render(r, fw, fh, "\\be2", 0, &bx,  &by);
+    uint64_t def = blurdefer_render(r, fw, fh, "\\be2", 1, &bx2, &by2);
+    int c1 = (def == ref) && bx2 == 0.0 && by2 == 0.0;
+    printf("BLURDEFER be-only: ref=%016llx def=%016llx blur=(%.3f,%.3f) -> %s\n",
+           (unsigned long long) ref, (unsigned long long) def, bx2, by2,
+           c1 ? "PASS" : "FAIL");
+    fails += !c1;
+
+    /* Case 2 (\be + \blur): the gaussian must be deferred (blur_x/blur_y > 0)
+     * and \be must still be applied. The exact pre-gaussian intermediate is not
+     * reachable through the public API, so the documented discriminator is:
+     * with the fix the deferred bitmap differs from the pure-unblurred coverage;
+     * without the fix \be is dropped and it would equal that raw coverage. */
+    uint64_t plain  = blurdefer_render(r, fw, fh, "",           1, &bx,  &by);
+    uint64_t beblur = blurdefer_render(r, fw, fh, "\\be2\\blur3", 1, &bx2, &by2);
+    int c2 = (bx2 > 0.0) && (by2 > 0.0) && (beblur != plain);
+    printf("BLURDEFER be+blur: plain=%016llx beblur=%016llx blur=(%.3f,%.3f) -> %s\n",
+           (unsigned long long) plain, (unsigned long long) beblur, bx2, by2,
+           c2 ? "PASS" : "FAIL");
+    fails += !c2;
+
+    printf("BLURDEFER: %d failures -> %s\n", fails, fails ? "FAIL" : "PASS");
+    return fails != 0;
+}
+
 /* ------------------------------------------------------------------------- */
 
 int main(int argc, char **argv)
 {
-    int threads = -1, fw = 1280, fh = 720, outline = 0;
+    int threads = -1, fw = 1280, fh = 720;
+    int mode = 0;   /* 0 = hash, 1 = outline, 2 = blurdefer */
     int argi = 1;
     for (; argi < argc && argv[argi][0] == '-'; argi++) {
         if (!strcmp(argv[argi], "-t") && argi + 1 < argc)
@@ -241,20 +335,22 @@ int main(int argc, char **argv)
             fw = atoi(argv[++argi]);
         else if (!strcmp(argv[argi], "-H") && argi + 1 < argc)
             fh = atoi(argv[++argi]);
-        else if (!strcmp(argv[argi], "-m") && argi + 1 < argc)
-            outline = !strcmp(argv[++argi], "outline");
-        else {
+        else if (!strcmp(argv[argi], "-m") && argi + 1 < argc) {
+            const char *mv = argv[++argi];
+            mode = !strcmp(mv, "outline")   ? 1 :
+                   !strcmp(mv, "blurdefer") ? 2 : 0;
+        } else {
             fprintf(stderr, "unknown option '%s'\n", argv[argi]);
             return 2;
         }
     }
     if (argi >= argc) {
-        fprintf(stderr, "usage: %s [-t threads] [-m hash|outline] "
+        fprintf(stderr, "usage: %s [-t threads] [-m hash|outline|blurdefer] "
                         "[-W w] [-H h] dir...\n", argv[0]);
         return 2;
     }
 #ifdef INT8K_NO_OUTLINE
-    if (outline) {
+    if (mode == 1) {
         fprintf(stderr, "outline mode not compiled in\n");
         return 2;
     }
@@ -278,9 +374,16 @@ int main(int argc, char **argv)
     if (threads >= 0)
         ass_set_render_thread_count(r, threads);
 #ifndef INT8K_NO_OUTLINE
-    if (outline)
+    if (mode == 1)
         ass_set_outline_deferred(r, 1);
 #endif
+
+    if (mode == 2) {   /* self-contained; ignores the .ass corpus */
+        int brc = run_blurdefer(r, fw, fh);
+        ass_renderer_done(r);
+        ass_library_done(g_lib);
+        return brc;
+    }
 
     int rc = 0, nsubs = 0;
     for (int d = argi; d < argc; d++) {
@@ -310,7 +413,7 @@ int main(int argc, char **argv)
             }
             nsubs++;
 #ifndef INT8K_NO_OUTLINE
-            if (outline)
+            if (mode == 1)
                 rc |= run_outline(r, track, names[i]);
             else
 #endif

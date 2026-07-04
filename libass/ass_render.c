@@ -3353,10 +3353,24 @@ size_t ass_composite_construct(void *key, void *value, void *priv)
 #endif
     bool blur_bm = !(flags & FILTER_NONZERO_BORDER) || (flags & FILTER_BORDER_STYLE_3);
     if (render_priv->blur_deferred) {
-        // Don't convolve: just expand the bitmaps to the bounds the blur would
-        // produce, and record the gaussian std-dev so a downstream consumer
-        // (e.g. the GPU) can apply it. NOTE (spike): box blur (\be) is not
-        // deferred; gaussian \blur only.
+        // ONLY the gaussian \blur is deferred here (recorded as blur_x/blur_y for
+        // a downstream consumer). The box blur \be must still be applied on the
+        // CPU: mirror the non-deferred ass_synth_blur call below but pass
+        // r2x=r2y=0 so ONLY the box component runs now, with the same blur_bm
+        // gating (bm_o border is always blurred). The combined bitmaps were
+        // already allocated with ass_be_padding(be) room above, so the box blur
+        // has its padding. The gaussian is then applied last by the consumer, so
+        // the effective order becomes gaussian(be(coverage)) rather than the
+        // non-deferred be(gaussian(coverage)) -- unavoidable when the gaussian is
+        // deferred, and the box blur is a small edge filter. \blur-only (be==0)
+        // is untouched.
+        if (k->filter.be) {
+            if (blur_bm)
+                ass_synth_blur(&render_priv->engine, blur_pool, &v->bm, k->filter.be, 0, 0);
+            ass_synth_blur(&render_priv->engine, blur_pool, &v->bm_o, k->filter.be, 0, 0);
+        }
+        // Don't convolve the gaussian: just expand the bitmaps to the bounds the
+        // blur would produce, and record its std-dev so the consumer can apply it.
         if (r2x > 0.001 || r2y > 0.001) {
             if (blur_bm)
                 ass_blur_expand_only(&render_priv->engine, &v->bm, r2x, r2y);
