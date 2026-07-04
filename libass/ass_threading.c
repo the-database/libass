@@ -110,9 +110,14 @@ static void run_claimed(ASS_ThreadPool *pool, TaskRegion *r, size_t idx,
     if (r->exclusive)
         tls_excl_depth--;
     tls_thread_id = saved;
+    // Read count BEFORE the final increment: the moment done reaches count,
+    // the region's owner may unlink the region and return, and *r (which
+    // lives in the owner's stack frame) dies with it. Only pool-owned state
+    // may be touched from here on.
+    size_t count = r->count;
     size_t d = ass_atomic_inc_size(&r->done);
     ass_mutex_lock(&pool->lock);
-    if (d == r->count)
+    if (d == count)
         ass_cond_broadcast(&pool->cond);   // the region's owner may be waiting
 }
 
