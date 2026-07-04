@@ -138,7 +138,22 @@ void ass_free_bitmap(Bitmap *bm)
 bool ass_copy_bitmap(const BitmapEngine *engine, Bitmap *dst, const Bitmap *src)
 {
     if (!src->buffer) {
+        // No CPU coverage. In outline-deferred mode the coverage is the packed
+        // tile blob in `segments`; carry it (and the outline metadata) across.
+        // An ordinary empty bitmap (segments == NULL) just zeroes dst.
         memset(dst, 0, sizeof(*dst));
+        if (src->segments && src->n_segments > 0) {
+            size_t n = (size_t) src->n_segments * sizeof(int32_t);
+            dst->segments = malloc(n);
+            if (!dst->segments)
+                return false;
+            memcpy(dst->segments, src->segments, n);
+            dst->n_segments = src->n_segments;
+            dst->left = src->left;
+            dst->top  = src->top;
+            dst->w    = src->w;
+            dst->h    = src->h;
+        }
         return true;
     }
     if (!ass_alloc_bitmap(engine, dst, src->w, src->h, false))
@@ -146,6 +161,20 @@ bool ass_copy_bitmap(const BitmapEngine *engine, Bitmap *dst, const Bitmap *src)
     dst->left = src->left;
     dst->top  = src->top;
     memcpy(dst->buffer, src->buffer, src->stride * src->h);
+    // A CPU-rasterized bitmap normally has no segments, but deep-copy them if
+    // present so ass_copy_bitmap is faithful in every mode. Each Bitmap owns its
+    // own malloc'd blob (freed by ass_free_bitmap), so there is no double free.
+    if (src->segments && src->n_segments > 0) {
+        size_t n = (size_t) src->n_segments * sizeof(int32_t);
+        dst->segments = malloc(n);
+        if (!dst->segments) {
+            ass_free_bitmap(dst);
+            memset(dst, 0, sizeof(*dst));
+            return false;
+        }
+        memcpy(dst->segments, src->segments, n);
+        dst->n_segments = src->n_segments;
+    }
     return true;
 }
 
