@@ -271,6 +271,19 @@ static bool add_cubic(RasterizerData *rst, const ASS_Vector *pt)
 #define TE_RAB(ab, scale) (((ab) * (int64_t)(scale) + ((int64_t)1 << (45 + 4))) >> (46 + 4))
 #define TE_RC(c, scale)   (((int32_t)((c) >> (7 + 4)) * (int64_t)(scale) + ((int64_t)1 << 44)) >> 45)
 
+// TE_RAB/TE_RC are the CPU tile filler's RESCALE_A_B/RESCALE_C macros
+// (c/rasterizer_template.h) with TILE_ORDER hard-wired to 4, and the export's
+// (bw+15)&~15 tiling assumes 16x16px tiles. The export always runs on its own
+// 16px C-ref engine (ass_bitmap_engine_init(0), tile_order 4) regardless of the
+// CONFIG_LARGE_TILES build option, so the blob is correct either way -- but the
+// large-tiles pairing of this GPU tile-export path is unvalidated, so fail the
+// build loudly rather than ship an untested combination. (CONFIG_LARGE_TILES is
+// the compile-time constant this keys on; ass_outline_to_tiles additionally
+// asserts eng.tile_order == 4 at runtime against a future engine-selection change.)
+#if CONFIG_LARGE_TILES
+#error "ass_outline_to_tiles GPU tile-export hardcodes 16px tiles (tile_order==4) and is not validated for large tiles; build without -Dlarge-tiles / --enable-large-tiles."
+#endif
+
 struct tile_export {
     float *tiles; int ntiles; size_t tiles_cap;   // TILE_EXPORT_W floats per tile
     float *segs;  int nsegs;  size_t segs_cap;     // SEG_EXPORT_W floats per segment
@@ -346,7 +359,14 @@ int ass_outline_to_tiles(const ASS_Outline *o0, const ASS_Outline *o1, int outli
                          int32_t *left, int32_t *top, int32_t *w, int32_t *h)
 {
     *tiles = NULL; *segs = NULL; *n_tiles = *n_segs = 0;
-    BitmapEngine eng = ass_bitmap_engine_init(0);   // C ref, 16px tiles
+    BitmapEngine eng = ass_bitmap_engine_init(0);   // C ref, forced 16px tiles
+    // Defensive: the TE_RAB/TE_RC rescale and the (bw+15)&~15 tiling below only
+    // hold for tile_order==4. ass_bitmap_engine_init(0) forces that today; guard
+    // so a future change to the engine selection fails loudly in debug and
+    // degrades to an empty export in release instead of silently miscompositing.
+    assert(eng.tile_order == 4);
+    if (eng.tile_order != 4)
+        return 0;
     RasterizerData rst;
     if (!ass_rasterizer_init(&eng, &rst, outline_error))
         return 0;
