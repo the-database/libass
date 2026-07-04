@@ -456,7 +456,16 @@ int ass_outline_to_tiles(const ASS_Outline *o0, const ASS_Outline *o1, int outli
     int32_t lx = (rst.bbox.x_min - 1) >> 6, ty = (rst.bbox.y_min - 1) >> 6;
     int32_t rx = (rst.bbox.x_max + 127) >> 6, by = (rst.bbox.y_max + 127) >> 6;
     int32_t bw = rx - lx, bh = by - ty;
+    // Mirror ass_outline_to_bitmap's "Glyph bounding box too large" guard (15 ==
+    // the 16px tile mask this export hardcodes) so a monstrous \fs/\fscx glyph
+    // degrades to an empty export instead of overflowing (bw+15) or attempting a
+    // multi-GB calloc. Returning 0 here matches the ass_outline_to_bitmap failure
+    // path: ass_bitmap_construct leaves an empty bitmap and the glyph is skipped.
+    if (bw < 0 || bh < 0 || bw > INT_MAX - 15 || bh > INT_MAX - 15)
+        goto done;
     int32_t tw = (bw + 15) & ~15, th = (bh + 15) & ~15;
+    if ((int64_t) tw * th > INT_MAX)
+        goto done;
     dummy = calloc(1, (size_t)tw * th);
     if (!dummy) goto done;
     eng.fill_solid = te_solid; eng.fill_halfplane = te_half; eng.fill_generic = te_generic;
