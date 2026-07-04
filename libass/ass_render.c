@@ -1000,7 +1000,11 @@ static void restore_transform(double m[3][3], const BitmapHashKey *key)
 // Calculate bitmap memory footprint
 static inline size_t bitmap_size(const Bitmap *bm)
 {
-    return bm->stride * bm->h;
+    // In outline-deferred mode the coverage lives in the tile blob (stride == 0,
+    // buffer == NULL), so stride*h is 0 -- add the blob so it is charged to the
+    // cache. n_segments is the blob's int32 count (0 for a CPU-rasterized bitmap).
+    return (size_t) bm->stride * bm->h +
+           (size_t) bm->n_segments * sizeof(int32_t);
 }
 
 /**
