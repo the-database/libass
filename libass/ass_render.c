@@ -531,27 +531,34 @@ static ASS_Image **render_shadow_deferred(CombinedBitmapInfo *info, uint32_t run
     double by = restore_blur(info->filter.blur_y);
     bx = bx > 0.001 ? sqrt(bx) : 0.0;
     by = by > 0.001 ? sqrt(by) : 0.0;
-    // The shadow is the SOLID silhouette: emit both the fill and the border (a
-    // ring) into one run -- they combine (saturating) to the filled dilated
-    // shape, matching libass's bm_s (derived from the border before fix_outline).
+    // ass_composite_construct's bm_s: for a bordered run (or a border_style 3
+    // box) the shadow is the border silhouette bm_o ALONE -- not fill+border.
+    // bm is contained in bm_o, but their rasterized AA values only agree where
+    // the fill's edge lies strictly inside the border's outer edge; when the
+    // border is thinner than the AA transition (steep 3D perspective squashes
+    // it), a saturating fill+border add overshoots the CPU's coverage. Only
+    // borderless runs shadow the fill. (The CPU's FILL_IN_BORDER &&
+    // !FILL_IN_SHADOW carve of bm_s is unreachable: FILL_IN_BORDER requires a
+    // fully opaque or border_style-3 fill, either of which sets
+    // FILL_IN_SHADOW, so no fix_outline on the shadow needs replicating.)
     // \be is inherited: the CPU copies bm_s from bm/bm_o AFTER ass_synth_blur,
     // so the shadow coverage carries the same box-blur iterations.
     int be = info->filter.be;
+    bool use_border = info->filter.flags &
+                      (FILTER_NONZERO_BORDER | FILTER_BORDER_STYLE_3);
     for (size_t j = 0; j < info->bitmap_count; j++) {
         BitmapRef *ref = &info->bitmaps[j];
-        for (int o = 0; o < 2; o++) {
-            Bitmap *bm = o ? ref->bm_o : ref->bm;
-            if (!bm || (!bm->buffer && !bm->n_segments))
-                continue;
-            ASS_Vector pos = o ? ref->pos_o : ref->pos;
-            ASS_Image *im = my_draw_glyph(bm, info->x + pos.x + sx, info->y + pos.y + sy,
-                                          color, IMAGE_TYPE_CHARACTER, bx, by, run_id,
-                                          RUN_FLAG_SHADOW | (rect_inverse ? RUN_FLAG_RECT_INVERSE : 0),
-                                          clip_id, rcx0, rcy0, rcx1, rcy1, color, 0, be);
-            if (im) {
-                *tail = im;
-                tail = &im->next;
-            }
+        Bitmap *bm = use_border ? ref->bm_o : ref->bm;
+        if (!bm || (!bm->buffer && !bm->n_segments))
+            continue;
+        ASS_Vector pos = use_border ? ref->pos_o : ref->pos;
+        ASS_Image *im = my_draw_glyph(bm, info->x + pos.x + sx, info->y + pos.y + sy,
+                                      color, IMAGE_TYPE_CHARACTER, bx, by, run_id,
+                                      RUN_FLAG_SHADOW | (rect_inverse ? RUN_FLAG_RECT_INVERSE : 0),
+                                      clip_id, rcx0, rcy0, rcx1, rcy1, color, 0, be);
+        if (im) {
+            *tail = im;
+            tail = &im->next;
         }
     }
     return tail;
@@ -1253,8 +1260,23 @@ static ASS_Image *render_text(RenderContext *state)
     for (unsigned i = 0; i < n_bitmaps; i++) {
         CombinedBitmapInfo *info = &bitmaps[i];
         if (info->deferred) {
-            tail = render_run_deferred(info, true, run_base + i + 1, clip_id,
-                                       rcx0, rcy0, rcx1, rcy1, rect_inverse, tail);
+            // Match the CPU path below: an un-sung \ko syllable draws no
+            // border (its shadow and fill are still drawn), so don't emit a
+            // border run for it either.
+            bool ko_unsung = info->effect_type == EF_KARAOKE_KO
+                    && info->effect_timing <= 0;
+            // A border_style-3 box without a real border: with a shadow the
+            // box IS the shadow (the CPU moves bm_o into bm_s and zeroes
+            // bm_o), so no border run either -- render_shadow_deferred above
+            // already emitted the box as the shadow run.
+            bool bs3_shadow_box =
+                    (info->filter.flags & FILTER_BORDER_STYLE_3) &&
+                    !(info->filter.flags & FILTER_NONZERO_BORDER) &&
+                    state->border_style != 4 &&
+                    (info->filter.shadow.x || info->filter.shadow.y);
+            if (!ko_unsung && !bs3_shadow_box)
+                tail = render_run_deferred(info, true, run_base + i + 1, clip_id,
+                                           rcx0, rcy0, rcx1, rcy1, rect_inverse, tail);
             continue;
         }
         if (!info->bm_o)
