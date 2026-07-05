@@ -105,6 +105,89 @@ typedef struct ass_image {
     uint64_t glyph_id;
     uint32_t run_id;
     uint32_t run_flags;
+
+    // Deferred-outline mode (ass_set_outline_deferred): instead of a rasterized
+    // coverage bitmap (bitmap == NULL), this image carries the glyph's coverage
+    // pre-split into 16x16-pixel tiles for a per-tile GPU filler. `outline`
+    // points to `n_outline` int32 values; floats in the tile/seg records are
+    // stored bit-for-bit (reinterpret the int32 as a float). w/h is the coverage
+    // bounding box in pixels and every coordinate below is relative to its
+    // origin (dst_x, dst_y). Layout (see ass_outline_to_tiles in
+    // ass_rasterizer.c, which produces it):
+    //
+    //   outline[0] = n_tiles  (> 0)
+    //   outline[1] = n_segs   (> 0)
+    //   outline[2 ..]                     n_tiles tile records, 11 int32 each
+    //   outline[2 + n_tiles*11 ..]        n_segs  seg  records,  8 int32 each
+    //   n_outline  = 2 + n_tiles*11 + n_segs*8
+    //
+    // Tile record (11 fields; #2 int, the rest as noted):
+    //   [0] tx, [1] ty : tile origin in pixels within the coverage bbox
+    //                    (multiples of 16; floats).
+    //   [2] ng         : number of groups, 1 or 2 (int32). Two groups are
+    //                    per-pixel max-merged to reproduce stroke self-overlap.
+    //   [3..6]  group 0 : { type, winding, seg_off, seg_cnt } (floats)
+    //   [7..10] group 1 : same, present iff ng == 2 (else zero-filled)
+    // Group fields:
+    //   type    : 0 = solid, 1 = single half-plane, 2 = generic (>=1 segments)
+    //   winding : solid -> 1 filled / 0 empty; generic -> entering winding count
+    //             at the tile's bottom-left corner (signed); half-plane -> 0
+    //   seg_off : index of the group's first seg in the seg pool (0 if solid)
+    //   seg_cnt : segment count (0 solid, 1 half-plane, N generic)
+    //
+    // Seg record (8 fields, all floats):
+    //   [0] a, [1] b, [2] c : half-plane line coefficients, pre-rescaled exactly
+    //                         as libass's CPU tile filler consumes them
+    //   [3] flags           : SEGFLAG_* bits for the generic filler (0 for the
+    //                         lone half-plane-group segment)
+    //   [4] x_min, [5] y_min, [6] y_max : tile-relative segment bounds in pixels
+    //                         for the generic filler (0 for a half-plane segment)
+    //   [7] unused (0)
+    int32_t *outline;
+    int32_t n_outline;
+
+    // Outline mode vector \clip: the clip is emitted as its own image with
+    // run_flags bit 1 (RUN_FLAG_CLIP_MASK) set -- its `outline` is the clip
+    // drawing's coverage, to rasterize into a mask (bit 2 RUN_FLAG_CLIP_INVERSE
+    // for \iclip). Every image of a clipped event carries `clip_id` == that mask
+    // image's run_id; the consumer multiplies the run coverage by the mask.
+    // 0 means the image is not clipped.
+    uint32_t clip_id;
+
+    // Outline mode rectangular \clip: the visible rectangle in storage pixels
+    // (same space as dst_x/dst_y). The consumer intersects the run's drawn area
+    // with this rect. Equal to the full frame when there is no rectangular clip
+    // (so intersecting is a no-op). Inverse rectangular \iclip is not expressed
+    // here (it goes through the clip-mask path instead).
+    int32_t clip_rx0, clip_ry0, clip_rx1, clip_ry1;
+
+    // Outline-mode \kf karaoke wipe: when run_flags bit 3 (RUN_FLAG_KF_WIPE) is
+    // set on a fill image, `color` paints left of screen-x `wipe_x` (the sung
+    // part) and `color2` to its right (unsung). Binary \k/\ko emit the whole
+    // fill in the right colour with no wipe (bit clear, color2/wipe_x unused).
+    uint32_t color2;
+    int32_t wipe_x;
+
+    // Outline-mode \be edge-blur: the consumer applies `be` iterations of the
+    // [1,2,1]/4 box to this run's coverage (0 = none).
+    int32_t be;
+
+    // Outline-mode deferred drop shadow (run_flags bit 5, RUN_FLAG_SHADOW):
+    // the sub-pixel fraction of the run's shadow offset, in 1/64ths of a
+    // pixel (0..63 per axis; 0/0 on all other images = no shift). dst_x/dst_y
+    // already contain the offset's integer part, floored exactly like the
+    // CPU's `bm_s.left += shadow.x >> 6` (before these fields existed the
+    // offset was rounded to the nearest pixel instead). The consumer must
+    // replicate ass_shift_bitmap's fixed-point bilinear smear on the run's
+    // final 8-bit coverage, AFTER the deferred gaussian blur and \be (the CPU
+    // copies bm_s from the already-blurred coverage, then shifts), exactly:
+    //   t(x,y)   = C(x,y) - (C(x,y)*shift_x64 >> 6) + (C(x-1,y)*shift_x64 >> 6)
+    //   out(x,y) = t(x,y) - (t(x,y)*shift_y64 >> 6) + (t(x,y-1)*shift_y64 >> 6)
+    // with C() the 0..255 coverage (0 outside the image) and truncating
+    // integer shifts. Coverage never reaches an image's last pixel column/row
+    // (the rasterization bbox keeps >= 1px of empty right/bottom slack, which
+    // blur expansion preserves), so the smear never spills past w/h.
+    int32_t shift_x64, shift_y64;
 } ASS_Image;
 
 /*
@@ -479,6 +562,21 @@ void ass_set_blur_deferred(ASS_Renderer *priv, int deferred);
  * \param deferred 0 to disable (default), non-zero to enable
  */
 void ass_set_composite_deferred(ASS_Renderer *priv, int deferred);
+
+/**
+ * \brief Emit glyph outlines as line segments for a GPU rasterizer, instead of
+ * rasterizing them on the CPU. Implies (and forces) deferred composite. In this
+ * mode ASS_Image.bitmap is NULL and ASS_Image.outline carries the glyph's
+ * flattened, transformed coverage outline (n_outline line segments, 4 int32
+ * each: x0,y0,x1,y1 in 1/64 px, relative to dst_x,dst_y). The downstream
+ * consumer rasterizes the coverage on the GPU, then combines/blurs/composites
+ * it. This moves the per-frame glyph rasterization off the CPU entirely.
+ *
+ * Default: off.
+ * \param priv renderer handle
+ * \param deferred 0 to disable (default), non-zero to enable
+ */
+void ass_set_outline_deferred(ASS_Renderer *priv, int deferred);
 
 /**
  * \brief Set shaping level. This is merely a hint, the renderer will use

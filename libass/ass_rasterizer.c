@@ -262,6 +262,152 @@ static bool add_cubic(RasterizerData *rst, const ASS_Vector *pt)
 }
 
 
+// --- GPU per-tile export -------------------------------------------------
+// Run libass's tile-split recursion but, instead of filling, capture each
+// leaf tile's clipped segments + entering winding (+ the 2-group max-merge
+// structure) into GPU-friendly flat buffers. A GPU shader then runs the
+// generic-tile filler per tile/group and max-merges the groups -- matching
+// libass's CPU output including stroke self-intersections.
+#define TE_RAB(ab, scale) (((ab) * (int64_t)(scale) + ((int64_t)1 << (45 + 4))) >> (46 + 4))
+#define TE_RC(c, scale)   (((int32_t)((c) >> (7 + 4)) * (int64_t)(scale) + ((int64_t)1 << 44)) >> 45)
+
+// TE_RAB/TE_RC are the CPU tile filler's RESCALE_A_B/RESCALE_C macros
+// (c/rasterizer_template.h) with TILE_ORDER hard-wired to 4, and the export's
+// (bw+15)&~15 tiling assumes 16x16px tiles. The export always runs on its own
+// 16px C-ref engine (ass_bitmap_engine_init(0), tile_order 4) regardless of the
+// CONFIG_LARGE_TILES build option, so the blob is correct either way -- but the
+// large-tiles pairing of this GPU tile-export path is unvalidated, so fail the
+// build loudly rather than ship an untested combination. (CONFIG_LARGE_TILES is
+// the compile-time constant this keys on; ass_outline_to_tiles additionally
+// asserts eng.tile_order == 4 at runtime against a future engine-selection change.)
+#if CONFIG_LARGE_TILES
+#error "ass_outline_to_tiles GPU tile-export hardcodes 16px tiles (tile_order==4) and is not validated for large tiles; build without -Dlarge-tiles / --enable-large-tiles."
+#endif
+
+struct tile_export {
+    float *tiles; int ntiles; size_t tiles_cap;   // TILE_EXPORT_W floats per tile
+    float *segs;  int nsegs;  size_t segs_cap;     // SEG_EXPORT_W floats per segment
+    uint8_t *base; ptrdiff_t stride; uint8_t *scratch;
+    bool ok;
+};
+static __thread struct tile_export *g_te;
+
+// append one segment (generic or halfplane params) to the pool, return its index
+static int te_push_seg(float a, float b, float c, float flags, float xmin, float ymin, float ymax)
+{
+    struct tile_export *te = g_te;
+    if ((size_t)(te->nsegs + 1) * SEG_EXPORT_W > te->segs_cap) {
+        size_t nc = te->segs_cap ? te->segs_cap * 2 : 4096;
+        float *p = realloc(te->segs, nc * sizeof(float));
+        if (!p) { te->ok = false; return 0; }
+        te->segs = p; te->segs_cap = nc;
+    }
+    float *s = te->segs + (size_t)te->nsegs * SEG_EXPORT_W;
+    s[0]=a; s[1]=b; s[2]=c; s[3]=flags; s[4]=xmin; s[5]=ymin; s[6]=ymax; s[7]=0;
+    return te->nsegs++;
+}
+// begin a tile group (type 0=solid,1=halfplane,2=generic) at buf; returns pointer to its 4-float group slot, or NULL
+static float *te_group(uint8_t *buf)
+{
+    struct tile_export *te = g_te;
+    if (buf == te->scratch) {                 // group 1 of the previous tile (merge)
+        if (!te->ntiles) return NULL;
+        float *t = te->tiles + (size_t)(te->ntiles - 1) * TILE_EXPORT_W;
+        if (t[2] >= 2) return NULL;
+        t[2] += 1;                            // ng -> 2
+        return t + 3 + 4;                     // group1 slot
+    }
+    if ((size_t)(te->ntiles + 1) * TILE_EXPORT_W > te->tiles_cap) {
+        size_t nc = te->tiles_cap ? te->tiles_cap * 2 : 1024 * TILE_EXPORT_W;
+        float *p = realloc(te->tiles, nc * sizeof(float));
+        if (!p) { te->ok = false; return NULL; }
+        te->tiles = p; te->tiles_cap = nc;
+    }
+    ptrdiff_t off = buf - te->base;
+    float *t = te->tiles + (size_t)te->ntiles * TILE_EXPORT_W;
+    t[0] = (float)(off % te->stride);         // tile x
+    t[1] = (float)(off / te->stride);         // tile y
+    t[2] = 1;                                 // ng
+    for (int i = 3; i < TILE_EXPORT_W; i++) t[i] = 0;
+    te->ntiles++;
+    return t + 3;                             // group0 slot
+}
+static void te_solid(uint8_t *buf, ptrdiff_t stride, int set)
+{ (void)stride; float *g = te_group(buf); if (g){ g[0]=0; g[1]=set?1:0; g[2]=0; g[3]=0; } }
+static void te_half(uint8_t *buf, ptrdiff_t stride, int32_t a, int32_t b, int64_t c, int32_t scale)
+{
+    (void)stride; float *g = te_group(buf); if (!g) return;
+    int si = te_push_seg((float)TE_RAB(a, scale), (float)TE_RAB(b, scale), (float)TE_RC(c, scale), 0,0,0,0);
+    g[0]=1; g[1]=0; g[2]=(float)si; g[3]=1;
+}
+static void te_generic(uint8_t *buf, ptrdiff_t stride, const struct segment *line, size_t n, int winding)
+{
+    (void)stride; float *g = te_group(buf); if (!g) return;
+    int off = g_te->nsegs;
+    for (size_t i = 0; i < n; i++) {
+        const struct segment *s = &line[i];
+        te_push_seg((float)TE_RAB(s->a, s->scale), (float)TE_RAB(s->b, s->scale),
+                    (float)TE_RC(s->c, s->scale), (float)s->flags,
+                    (float)s->x_min, (float)s->y_min, (float)s->y_max);
+    }
+    g[0]=2; g[1]=(float)(int8_t)winding; g[2]=(float)off; g[3]=(float)n;
+}
+
+// Returns number of tiles; *tiles/*segs are malloc'd flat buffers (caller frees).
+int ass_outline_to_tiles(const ASS_Outline *o0, const ASS_Outline *o1, int outline_error,
+                         float **tiles, int *n_tiles, float **segs, int *n_segs,
+                         int32_t *left, int32_t *top, int32_t *w, int32_t *h)
+{
+    *tiles = NULL; *segs = NULL; *n_tiles = *n_segs = 0;
+    BitmapEngine eng = ass_bitmap_engine_init(0);   // C ref, forced 16px tiles
+    // Defensive: the TE_RAB/TE_RC rescale and the (bw+15)&~15 tiling below only
+    // hold for tile_order==4. ass_bitmap_engine_init(0) forces that today; guard
+    // so a future change to the engine selection fails loudly in debug and
+    // degrades to an empty export in release instead of silently miscompositing.
+    assert(eng.tile_order == 4);
+    if (eng.tile_order != 4)
+        return 0;
+    RasterizerData rst;
+    if (!ass_rasterizer_init(&eng, &rst, outline_error))
+        return 0;
+    int ret = 0; uint8_t *dummy = NULL;
+    struct tile_export te = {0}; te.ok = true;
+    if (!ass_rasterizer_set_outline(&rst, o0, false) ||
+        (o1 && !ass_rasterizer_set_outline(&rst, o1, true)))
+        goto done;
+    if (rst.bbox.x_min > rst.bbox.x_max)
+        goto done;
+    int32_t lx = (rst.bbox.x_min - 1) >> 6, ty = (rst.bbox.y_min - 1) >> 6;
+    int32_t rx = (rst.bbox.x_max + 127) >> 6, by = (rst.bbox.y_max + 127) >> 6;
+    int32_t bw = rx - lx, bh = by - ty;
+    // Mirror ass_outline_to_bitmap's "Glyph bounding box too large" guard (15 ==
+    // the 16px tile mask this export hardcodes) so a monstrous \fs/\fscx glyph
+    // degrades to an empty export instead of overflowing (bw+15) or attempting a
+    // multi-GB calloc. Returning 0 here matches the ass_outline_to_bitmap failure
+    // path: ass_bitmap_construct leaves an empty bitmap and the glyph is skipped.
+    if (bw < 0 || bh < 0 || bw > INT_MAX - 15 || bh > INT_MAX - 15)
+        goto done;
+    int32_t tw = (bw + 15) & ~15, th = (bh + 15) & ~15;
+    if ((int64_t) tw * th > INT_MAX)
+        goto done;
+    dummy = calloc(1, (size_t)tw * th);
+    if (!dummy) goto done;
+    eng.fill_solid = te_solid; eng.fill_halfplane = te_half; eng.fill_generic = te_generic;
+    te.base = dummy; te.stride = tw; te.scratch = rst.tile;
+    g_te = &te;
+    ass_rasterizer_fill(&eng, &rst, dummy, lx, ty, tw, th, tw);
+    g_te = NULL;
+    if (!te.ok) goto done;
+    *tiles = te.tiles; *n_tiles = te.ntiles; *segs = te.segs; *n_segs = te.nsegs;
+    *left = lx; *top = ty; *w = bw; *h = bh;
+    ret = te.ntiles;
+done:
+    free(dummy);
+    ass_rasterizer_done(&rst);
+    if (!ret) { free(te.tiles); free(te.segs); }
+    return ret;
+}
+
 bool ass_rasterizer_set_outline(RasterizerData *rst,
                                 const ASS_Outline *path, bool extra)
 {

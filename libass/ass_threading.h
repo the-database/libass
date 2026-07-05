@@ -133,10 +133,21 @@ static inline size_t ass_atomic_load_size(const ass_atomic_size_t *p)
 static inline void   ass_atomic_store_size(ass_atomic_size_t *p, size_t v)
 { ASS_ILEXCH((volatile ASS_ILACTYPE *) p, (ASS_ILACTYPE) v); }
 
+// Publication/consumption pair: Interlocked intrinsics are full barriers,
+// which subsumes the release/acquire these require. The acquire load is an
+// interlocked add of 0 so it carries the barrier on all MSVC targets
+// (a plain volatile read is only acquire under /volatile:ms).
+static inline size_t ass_atomic_inc_size_release(ass_atomic_size_t *p)
+{ return (size_t) ASS_ILADD((volatile ASS_ILACTYPE *) p, 1) + 1; }
+static inline size_t ass_atomic_load_size_acquire(const ass_atomic_size_t *p)
+{ return (size_t) ASS_ILADD((volatile ASS_ILACTYPE *) (ass_atomic_size_t *) p, 0); }
+
 static inline unsigned ass_atomic_load_uint(const ass_atomic_uint_t *p)
 { return *p; }
 static inline void     ass_atomic_store_uint(ass_atomic_uint_t *p, unsigned v)
 { _InterlockedExchange((volatile long *) p, (long) v); }
+static inline unsigned ass_atomic_add_uint(ass_atomic_uint_t *p, unsigned n)
+{ return (unsigned) _InterlockedExchangeAdd((volatile long *) p, (long) n); }
 
 #else
 
@@ -154,10 +165,22 @@ static inline size_t ass_atomic_load_size(const ass_atomic_size_t *p)
 static inline void   ass_atomic_store_size(ass_atomic_size_t *p, size_t v)
 { atomic_store_explicit(p, v, memory_order_relaxed); }
 
+// Publication/consumption pair for counters that hand data between threads
+// (the thread pool's per-region completion count): every incrementer releases
+// its preceding writes, and a load-acquire that observes the final value
+// synchronizes with all of them (the increments are RMWs, so each release's
+// release sequence extends through the later increments).
+static inline size_t ass_atomic_inc_size_release(ass_atomic_size_t *p)
+{ return atomic_fetch_add_explicit(p, 1, memory_order_release) + 1; }
+static inline size_t ass_atomic_load_size_acquire(const ass_atomic_size_t *p)
+{ return atomic_load_explicit(p, memory_order_acquire); }
+
 static inline unsigned ass_atomic_load_uint(const ass_atomic_uint_t *p)
 { return atomic_load_explicit(p, memory_order_relaxed); }
 static inline void     ass_atomic_store_uint(ass_atomic_uint_t *p, unsigned v)
 { atomic_store_explicit(p, v, memory_order_relaxed); }
+static inline unsigned ass_atomic_add_uint(ass_atomic_uint_t *p, unsigned n)
+{ return atomic_fetch_add_explicit(p, n, memory_order_relaxed); }
 
 #endif // atomics backend
 
@@ -215,8 +238,12 @@ static inline size_t ass_atomic_dec_size(ass_atomic_size_t *p)        { return -
 static inline size_t ass_atomic_load_size(const ass_atomic_size_t *p) { return *p; }
 static inline void   ass_atomic_store_size(ass_atomic_size_t *p, size_t v) { *p = v; }
 
+static inline size_t ass_atomic_inc_size_release(ass_atomic_size_t *p)        { return ++(*p); }
+static inline size_t ass_atomic_load_size_acquire(const ass_atomic_size_t *p) { return *p; }
+
 static inline unsigned ass_atomic_load_uint(const ass_atomic_uint_t *p) { return *p; }
 static inline void     ass_atomic_store_uint(ass_atomic_uint_t *p, unsigned v) { *p = v; }
+static inline unsigned ass_atomic_add_uint(ass_atomic_uint_t *p, unsigned n) { unsigned o = *p; *p += n; return o; }
 
 #endif // CONFIG_THREADS
 

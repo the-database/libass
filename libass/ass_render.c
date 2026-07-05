@@ -353,9 +353,21 @@ static ASS_Image *my_draw_bitmap(unsigned char *bitmap, int bitmap_w,
 
     // Combined (legacy / blur-deferred) images are not per-glyph: a downstream
     // GPU compositor must route them the normal way, so zero the glyph fields.
+    // Initialize EVERY outline-mode field too -- the consumer (mpv packer) copies
+    // them unconditionally, so leaving them uninitialized feeds garbage downstream
+    // (intermittent crashes, e.g. the OSD/stats path that recycles these images).
     img->result.glyph_id = 0;
     img->result.run_id = 0;
     img->result.run_flags = 0;
+    img->result.outline = NULL;
+    img->result.n_outline = 0;
+    img->result.clip_id = 0;
+    img->result.clip_rx0 = img->result.clip_ry0 = 0;
+    img->result.clip_rx1 = img->result.clip_ry1 = 0;
+    img->result.color2 = color;
+    img->result.wipe_x = 0;
+    img->result.be = 0;
+    img->result.shift_x64 = img->result.shift_y64 = 0;
 
     img->source = source;
     ass_cache_inc_ref(source);
@@ -393,11 +405,23 @@ static bool composite_deferrable(RenderContext *state)
 static ASS_Image *my_draw_glyph(Bitmap *bm, int dst_x, int dst_y,
                                 uint32_t color, unsigned type,
                                 double blur_x, double blur_y,
-                                uint32_t run_id, uint32_t run_flags)
+                                uint32_t run_id, uint32_t run_flags,
+                                uint32_t clip_id,
+                                int32_t rcx0, int32_t rcy0,
+                                int32_t rcx1, int32_t rcy1,
+                                uint32_t color2, int32_t wipe_x, int32_t be)
 {
     ASS_ImagePriv *img = malloc(sizeof(ASS_ImagePriv));
     if (!img)
         return NULL;
+    img->result.be = be;
+    img->result.clip_id = clip_id;
+    img->result.clip_rx0 = rcx0;
+    img->result.clip_ry0 = rcy0;
+    img->result.clip_rx1 = rcx1;
+    img->result.clip_ry1 = rcy1;
+    img->result.color2 = color2;
+    img->result.wipe_x = wipe_x;
     img->result.w = bm->w;
     img->result.h = bm->h;
     img->result.stride = bm->stride;
@@ -411,6 +435,9 @@ static ASS_Image *my_draw_glyph(Bitmap *bm, int dst_x, int dst_y,
     img->result.glyph_id = bm->cache_id;   // stable per cached glyph (Stage B cache)
     img->result.run_id = run_id;
     img->result.run_flags = run_flags;
+    img->result.outline = bm->segments;    // outline-deferred: GPU rasterizes these
+    img->result.n_outline = bm->n_segments;
+    img->result.shift_x64 = img->result.shift_y64 = 0;  // set by the shadow emitter
     img->source = (CompositeHashValue *) bm;
     ass_cache_inc_ref(bm);
     img->buffer = NULL;
@@ -420,14 +447,40 @@ static ASS_Image *my_draw_glyph(Bitmap *bm, int dst_x, int dst_y,
 
 // Emit the glyphs of a deferred run for one coverage layer (outline bm_o or
 // fill bm), in the run's order. Returns the new image-list tail.
+// run_flags ABI bits (also read by the GPU consumer in mpv):
+#define RUN_FLAG_FIX_OUTLINE  0x1   // subtract fill from border (fix_outline)
+#define RUN_FLAG_CLIP_MASK    0x2   // this image is a vector-clip mask, not visible
+#define RUN_FLAG_CLIP_INVERSE 0x4   // the clip mask is inverse (\iclip)
+#define RUN_FLAG_KF_WIPE      0x8   // \kf fill: color left of wipe_x, color2 right
+#define RUN_FLAG_RECT_INVERSE 0x10  // \iclip rect: the clip rect is EXCLUDED, not visible
+#define RUN_FLAG_SHADOW       0x20  // this run is a drop shadow (draw behind border+fill)
+
 static ASS_Image **render_run_deferred(CombinedBitmapInfo *info, bool outline,
-                                       uint32_t run_id, ASS_Image **tail)
+                                       uint32_t run_id, uint32_t clip_id,
+                                       int32_t rcx0, int32_t rcy0,
+                                       int32_t rcx1, int32_t rcy1,
+                                       bool rect_inverse, ASS_Image **tail)
 {
     // Clean run_flags ABI for the GPU consumer: bit 0 = apply fix_outline
     // (subtract fill from border), matching ass_composite_construct's gate.
     // Deferred runs never carry a shadow, so only FILL_IN_BORDER matters.
     uint32_t flags = (info->filter.flags & FILTER_FILL_IN_BORDER) ? 0 : 1;
+    if (rect_inverse) flags |= RUN_FLAG_RECT_INVERSE;
     uint32_t color = outline ? info->c[2] : info->c[0];
+    // Karaoke recolours the fill only (the border stays uniform c[2]). \k/\ko
+    // switch the whole syllable (sung c[0] once effect_timing>0, else unsung
+    // c[1]); \kf wipes -- color left of screen-x effect_timing, color2 right.
+    uint32_t color2 = color;
+    int32_t wipe_x = 0;
+    if (!outline) {
+        if (info->effect_type == EF_KARAOKE || info->effect_type == EF_KARAOKE_KO) {
+            color = color2 = (info->effect_timing > 0) ? info->c[0] : info->c[1];
+        } else if (info->effect_type == EF_KARAOKE_KF) {
+            color = info->c[0];            color2 = info->c[1];
+            wipe_x = info->effect_timing;
+            flags |= RUN_FLAG_KF_WIPE;
+        }
+    }
     unsigned type = outline ? IMAGE_TYPE_OUTLINE : IMAGE_TYPE_CHARACTER;
     double bx = restore_blur(info->filter.blur_x);
     double by = restore_blur(info->filter.blur_y);
@@ -439,15 +492,81 @@ static ASS_Image **render_run_deferred(CombinedBitmapInfo *info, bool outline,
                      (info->filter.flags & FILTER_BORDER_STYLE_3);
     if (!outline && !blur_fill)
         bx = by = 0.0;
+    // \be edge-blur: the consumer runs `be` iterations of the [1,2,1]/4 box on
+    // the GPU coverage (no bitmap here to run the CPU be_blur on). Gated like
+    // the gaussian above: ass_composite_construct's blur_bm applies \be to the
+    // fill only when there is no (nonzero) border; the border always gets it.
+    int be = info->filter.be;
+    if (!outline && !blur_fill)
+        be = 0;
     for (size_t j = 0; j < info->bitmap_count; j++) {
         BitmapRef *ref = &info->bitmaps[j];
         Bitmap *bm = outline ? ref->bm_o : ref->bm;
-        if (!bm || !bm->buffer)
+        if (!bm || (!bm->buffer && !bm->n_segments))
             continue;
         ASS_Vector pos = outline ? ref->pos_o : ref->pos;
         ASS_Image *im = my_draw_glyph(bm, info->x + pos.x, info->y + pos.y,
-                                      color, type, bx, by, run_id, flags);
+                                      color, type, bx, by, run_id, flags, clip_id,
+                                      rcx0, rcy0, rcx1, rcy1, color2, wipe_x, be);
         if (im) {
+            *tail = im;
+            tail = &im->next;
+        }
+    }
+    return tail;
+}
+
+// Deferred shadow: emit each glyph's border (or fill) coverage shifted by the
+// run's shadow offset, in the shadow colour, as its own coverage run (run_id).
+// Emitted before the fill/border runs so it composites behind them. The offset
+// splits exactly like the CPU's (ass_composite_construct): integer part into
+// dst_x/dst_y ('>>' floors), sub-pixel remainder (0..63, 1/64 px) into
+// shift_x64/shift_y64 for the consumer's ass_shift_bitmap-equivalent smear.
+static ASS_Image **render_shadow_deferred(CombinedBitmapInfo *info, uint32_t run_id,
+                                          uint32_t clip_id,
+                                          int32_t rcx0, int32_t rcy0,
+                                          int32_t rcx1, int32_t rcy1,
+                                          bool rect_inverse, ASS_Image **tail)
+{
+    uint32_t color = info->c[3];
+    // Works right even for negative offsets: '>>' rounds toward negative
+    // infinity and '&' returns the correct (non-negative) remainder.
+    int sx = info->filter.shadow.x >> 6;
+    int sy = info->filter.shadow.y >> 6;
+    int fx = info->filter.shadow.x & SUBPIXEL_MASK;
+    int fy = info->filter.shadow.y & SUBPIXEL_MASK;
+    double bx = restore_blur(info->filter.blur_x);
+    double by = restore_blur(info->filter.blur_y);
+    bx = bx > 0.001 ? sqrt(bx) : 0.0;
+    by = by > 0.001 ? sqrt(by) : 0.0;
+    // ass_composite_construct's bm_s: for a bordered run (or a border_style 3
+    // box) the shadow is the border silhouette bm_o ALONE -- not fill+border.
+    // bm is contained in bm_o, but their rasterized AA values only agree where
+    // the fill's edge lies strictly inside the border's outer edge; when the
+    // border is thinner than the AA transition (steep 3D perspective squashes
+    // it), a saturating fill+border add overshoots the CPU's coverage. Only
+    // borderless runs shadow the fill. (The CPU's FILL_IN_BORDER &&
+    // !FILL_IN_SHADOW carve of bm_s is unreachable: FILL_IN_BORDER requires a
+    // fully opaque or border_style-3 fill, either of which sets
+    // FILL_IN_SHADOW, so no fix_outline on the shadow needs replicating.)
+    // \be is inherited: the CPU copies bm_s from bm/bm_o AFTER ass_synth_blur,
+    // so the shadow coverage carries the same box-blur iterations.
+    int be = info->filter.be;
+    bool use_border = info->filter.flags &
+                      (FILTER_NONZERO_BORDER | FILTER_BORDER_STYLE_3);
+    for (size_t j = 0; j < info->bitmap_count; j++) {
+        BitmapRef *ref = &info->bitmaps[j];
+        Bitmap *bm = use_border ? ref->bm_o : ref->bm;
+        if (!bm || (!bm->buffer && !bm->n_segments))
+            continue;
+        ASS_Vector pos = use_border ? ref->pos_o : ref->pos;
+        ASS_Image *im = my_draw_glyph(bm, info->x + pos.x + sx, info->y + pos.y + sy,
+                                      color, IMAGE_TYPE_CHARACTER, bx, by, run_id,
+                                      RUN_FLAG_SHADOW | (rect_inverse ? RUN_FLAG_RECT_INVERSE : 0),
+                                      clip_id, rcx0, rcy0, rcx1, rcy1, color, 0, be);
+        if (im) {
+            im->shift_x64 = fx;
+            im->shift_y64 = fy;
             *tail = im;
             tail = &im->next;
         }
@@ -905,7 +1024,11 @@ static void restore_transform(double m[3][3], const BitmapHashKey *key)
 // Calculate bitmap memory footprint
 static inline size_t bitmap_size(const Bitmap *bm)
 {
-    return bm->stride * bm->h;
+    // In outline-deferred mode the coverage lives in the tile blob (stride == 0,
+    // buffer == NULL), so stride*h is 0 -- add the blob so it is charged to the
+    // cache. n_segments is the blob's int32 count (0 for a CPU-rasterized bitmap).
+    return (size_t) bm->stride * bm->h +
+           (size_t) bm->n_segments * sizeof(int32_t);
 }
 
 /**
@@ -1030,6 +1153,53 @@ static void blend_vector_clip(RenderContext *state, ASS_Image *head)
     }
 }
 
+// Outline mode: emit the vector \clip drawing as a mask image (run_id == clip_id,
+// RUN_FLAG_CLIP_MASK). The clip bitmap goes through the same outline-deferred
+// raster path, so it already carries segments -- reuse blend_vector_clip's setup.
+static ASS_Image **emit_clip_mask(RenderContext *state, uint32_t clip_id,
+                                  ASS_Image **tail)
+{
+    if (!state->clip_drawing_text.str)
+        return tail;
+    ASS_Renderer *render_priv = state->renderer;
+
+    OutlineHashKey ol_key;
+    ol_key.type = OUTLINE_DRAWING;
+    ol_key.u.drawing.text = state->clip_drawing_text;
+
+    double m[3][3] = {{0}};
+    int32_t scale_base = lshiftwrapi(1, state->clip_drawing_scale - 1);
+    double w = scale_base > 0 ? (1.0 / scale_base) : 0;
+    m[0][0] = state->screen_scale_x * w;
+    m[1][1] = state->screen_scale_y * w;
+    m[2][2] = 1;
+    m[0][2] = int_to_d6(render_priv->settings.left_margin);
+    m[1][2] = int_to_d6(render_priv->settings.top_margin);
+
+    ASS_Vector pos;
+    BitmapHashKey key;
+    key.outline = ass_cache_get(render_priv->cache.outline_cache, &ol_key, render_priv);
+    if (!key.outline || !key.outline->valid ||
+            !quantize_transform(m, &pos, NULL, true, &key))
+        return tail;
+
+    Bitmap *clip_bm = ass_cache_get(render_priv->cache.bitmap_cache, &key,
+                                    &(BitmapConstructCtx){ state, &state->rasterizer });
+    if (!clip_bm || (!clip_bm->buffer && !clip_bm->n_segments))
+        return tail;
+
+    uint32_t flags = RUN_FLAG_CLIP_MASK |
+                     (state->clip_drawing_mode ? RUN_FLAG_CLIP_INVERSE : 0);
+    ASS_Image *im = my_draw_glyph(clip_bm, pos.x, pos.y, 0, IMAGE_TYPE_CHARACTER,
+                                  0, 0, clip_id, flags, 0,
+                                  0, 0, render_priv->width, render_priv->height, 0, 0, 0);
+    if (im) {
+        *tail = im;
+        tail = &im->next;
+    }
+    return tail;
+}
+
 /**
  * \brief Convert TextInfo struct to ASS_Image list
  * Splits glyphs in halves when needed (for \kf karaoke).
@@ -1041,8 +1211,54 @@ static ASS_Image *render_text(RenderContext *state)
     unsigned n_bitmaps = state->text_info.n_bitmaps;
     CombinedBitmapInfo *bitmaps = state->text_info.combined_bitmaps;
 
+    // Run ids must be unique across the whole frame, not just this event, or
+    // mpv's compositor would merge same-index runs from different events into
+    // one region. Reserve a frame-wide block of 2*n_bitmaps (fill/border + a
+    // second set for deferred shadows) plus 1 for this event's clip mask.
+    // Atomic: events may render in parallel.
+    uint32_t run_base = ass_atomic_add_uint(&state->renderer->deferred_run_base,
+                                            n_bitmaps * 2 + 1);
+
+    // Outline-mode vector \clip: emit the clip drawing as a mask run; every run
+    // of this event carries clip_id so the GPU multiplies its coverage by it.
+    uint32_t clip_id = 0;
+    if (state->renderer->outline_deferred && state->clip_drawing_text.str) {
+        clip_id = run_base + n_bitmaps * 2 + 1;
+        tail = emit_clip_mask(state, clip_id, tail);
+    }
+
+    // Outline-mode rectangular \clip: every deferred run carries a rect (storage
+    // px). Normal \clip -> the visible rect, intersected by the consumer (full
+    // frame = no-op when unclipped). Inverse \iclip -> the EXCLUDED rect plus
+    // RUN_FLAG_RECT_INVERSE, which the consumer subtracts from the drawn area.
+    ASS_Renderer *rp = state->renderer;
+    int32_t rcx0 = 0, rcy0 = 0, rcx1 = rp->width, rcy1 = rp->height;
+    bool rect_inverse = false;
+    if (state->clip_mode) {
+        rect_inverse = true;
+        rcx0 = FFMINMAX(state->clip_x0, 0, rp->width);
+        rcy0 = FFMINMAX(state->clip_y0, 0, rp->height);
+        rcx1 = FFMINMAX(state->clip_x1, 0, rp->width);
+        rcy1 = FFMINMAX(state->clip_y1, 0, rp->height);
+    } else {
+        rcx0 = FFMINMAX(state->clip_x0, 0, rp->width);
+        rcy0 = FFMINMAX(state->clip_y0, 0, rp->height);
+        rcx1 = FFMINMAX(state->clip_x1, 0, rp->width);
+        rcy1 = FFMINMAX(state->clip_y1, 0, rp->height);
+    }
+
     for (unsigned i = 0; i < n_bitmaps; i++) {
         CombinedBitmapInfo *info = &bitmaps[i];
+        if (info->deferred) {
+            // Outline mode: shadow coverage isn't on the CPU; emit it as its own
+            // run, behind the fill/border (drawn next).
+            if (state->border_style != 4 &&
+                (info->filter.shadow.x || info->filter.shadow.y))
+                tail = render_shadow_deferred(info, run_base + n_bitmaps + i + 1,
+                                              clip_id, rcx0, rcy0, rcx1, rcy1,
+                                              rect_inverse, tail);
+            continue;
+        }
         if (!info->bm_s || state->border_style == 4)
             continue;
 
@@ -1054,7 +1270,23 @@ static ASS_Image *render_text(RenderContext *state)
     for (unsigned i = 0; i < n_bitmaps; i++) {
         CombinedBitmapInfo *info = &bitmaps[i];
         if (info->deferred) {
-            tail = render_run_deferred(info, true, i + 1, tail);
+            // Match the CPU path below: an un-sung \ko syllable draws no
+            // border (its shadow and fill are still drawn), so don't emit a
+            // border run for it either.
+            bool ko_unsung = info->effect_type == EF_KARAOKE_KO
+                    && info->effect_timing <= 0;
+            // A border_style-3 box without a real border: with a shadow the
+            // box IS the shadow (the CPU moves bm_o into bm_s and zeroes
+            // bm_o), so no border run either -- render_shadow_deferred above
+            // already emitted the box as the shadow run.
+            bool bs3_shadow_box =
+                    (info->filter.flags & FILTER_BORDER_STYLE_3) &&
+                    !(info->filter.flags & FILTER_NONZERO_BORDER) &&
+                    state->border_style != 4 &&
+                    (info->filter.shadow.x || info->filter.shadow.y);
+            if (!ko_unsung && !bs3_shadow_box)
+                tail = render_run_deferred(info, true, run_base + i + 1, clip_id,
+                                           rcx0, rcy0, rcx1, rcy1, rect_inverse, tail);
             continue;
         }
         if (!info->bm_o)
@@ -1073,7 +1305,8 @@ static ASS_Image *render_text(RenderContext *state)
     for (unsigned i = 0; i < n_bitmaps; i++) {
         CombinedBitmapInfo *info = &bitmaps[i];
         if (info->deferred) {
-            tail = render_run_deferred(info, false, i + 1, tail);
+            tail = render_run_deferred(info, false, run_base + i + 1, clip_id,
+                                       rcx0, rcy0, rcx1, rcy1, rect_inverse, tail);
             free(info->bitmaps);    // owned by us in deferred mode (no combine)
             info->bitmaps = NULL;
             continue;
@@ -1105,7 +1338,11 @@ static ASS_Image *render_text(RenderContext *state)
     }
 
     *tail = 0;
-    blend_vector_clip(state, head);
+    // Vector \clip multiplies each image's CPU coverage; outline-deferred images
+    // have none (segments only), so skip it (clip not applied -- needs a GPU
+    // clip-mask multiply, not yet implemented).
+    if (!state->renderer->outline_deferred)
+        blend_vector_clip(state, head);
 
     return head;
 }
@@ -1644,7 +1881,7 @@ get_bitmap_glyph(RenderContext *state, RasterizerData *rst, GlyphInfo *info,
 
     info->bm = ass_cache_get(render_priv->cache.bitmap_cache, &key,
                              &(BitmapConstructCtx){ state, rst });
-    if (!info->bm || !info->bm->buffer)
+    if (!info->bm || (!info->bm->buffer && !info->bm->n_segments))
         info->bm = NULL;
 
     *pos_o = *pos;
@@ -1769,7 +2006,7 @@ get_bitmap_glyph(RenderContext *state, RasterizerData *rst, GlyphInfo *info,
 
     info->bm_o = ass_cache_get(render_priv->cache.bitmap_cache, &key,
                                &(BitmapConstructCtx){ state, rst });
-    if (!info->bm_o || !info->bm_o->buffer) {
+    if (!info->bm_o || (!info->bm_o->buffer && !info->bm_o->n_segments)) {
         info->bm_o = NULL;
         *pos_o = *pos;
     } else if (!info->bm)
@@ -1800,8 +2037,33 @@ size_t ass_bitmap_construct(void *key, void *value, void *priv)
         ass_outline_transform_2d(&outline[1], &k->outline->outline[1], m);
     }
 
-    if (!ass_outline_to_bitmap(state, ctx->rst, bm, &outline[0], &outline[1]))
+    if (state->renderer->outline_deferred) {
+        // GPU-rasterizer mode: tile-split on the CPU and emit per-tile clipped
+        // segments + winding (+ 2-group merge) for a per-tile GPU filler. Packed
+        // into bm->segments as: [n_tiles, n_segs, tiles(float bits), segs(float
+        // bits)] -- the GPU parses this. Matches libass CPU incl. self-intersect.
         memset(bm, 0, sizeof(*bm));
+        int32_t left, top, w, h;
+        float *tiles = NULL, *segs = NULL; int nt = 0, ns = 0;
+        ass_outline_to_tiles(&outline[0], &outline[1], RASTERIZER_PRECISION,
+                             &tiles, &nt, &segs, &ns, &left, &top, &w, &h);
+        if (nt > 0) {
+            size_t total = 2 + (size_t) nt * TILE_EXPORT_W + (size_t) ns * SEG_EXPORT_W;
+            int32_t *blob = malloc(total * sizeof(int32_t));
+            if (blob) {
+                blob[0] = nt; blob[1] = ns;
+                memcpy(blob + 2, tiles, (size_t) nt * TILE_EXPORT_W * sizeof(float));
+                memcpy(blob + 2 + (size_t) nt * TILE_EXPORT_W, segs,
+                       (size_t) ns * SEG_EXPORT_W * sizeof(float));
+                bm->segments = blob;
+                bm->n_segments = (int) total;
+            }
+            bm->left = left; bm->top = top; bm->w = w; bm->h = h;
+        }
+        free(tiles); free(segs);
+    } else if (!ass_outline_to_bitmap(state, ctx->rst, bm, &outline[0], &outline[1])) {
+        memset(bm, 0, sizeof(*bm));
+    }
     ass_outline_free(&outline[0]);
     ass_outline_free(&outline[1]);
 
@@ -2928,10 +3190,17 @@ static void render_and_combine_glyphs(RenderContext *state,
         // Composite-deferred runs (no shadow, no karaoke) skip the CPU combine
         // and keep their per-glyph bitmaps for per-glyph emission in render_text;
         // the GPU consumer combines them. Shadow/karaoke runs fall back here.
-        if (deferrable && info->effect_type == EF_NONE &&
-            !(info->filter.flags & FILTER_NONZERO_SHADOW)) {
+        // In outline-deferred mode the per-glyph bitmaps carry no CPU coverage
+        // (segments only), so the CPU composite path below would crash -- force
+        // every run deferred. (Vector \clip can't fall back to the CPU here: the
+        // renderer is globally in segment mode, so combine_bitmaps would read NULL
+        // -- clip needs a GPU clip-mask multiply instead, not yet implemented.)
+        if (render_priv->outline_deferred ||
+            (deferrable && info->effect_type == EF_NONE &&
+             !(info->filter.flags & FILTER_NONZERO_SHADOW))) {
             info->deferred = true;
-            continue;
+            info->bm = info->bm_o = info->bm_s = NULL;  // deferred path uses info->bitmaps;
+            continue;                                   // keep the shadow pass from reading these
         }
 
         CompositeHashKey key;
@@ -3123,10 +3392,24 @@ size_t ass_composite_construct(void *key, void *value, void *priv)
 #endif
     bool blur_bm = !(flags & FILTER_NONZERO_BORDER) || (flags & FILTER_BORDER_STYLE_3);
     if (render_priv->blur_deferred) {
-        // Don't convolve: just expand the bitmaps to the bounds the blur would
-        // produce, and record the gaussian std-dev so a downstream consumer
-        // (e.g. the GPU) can apply it. NOTE (spike): box blur (\be) is not
-        // deferred; gaussian \blur only.
+        // ONLY the gaussian \blur is deferred here (recorded as blur_x/blur_y for
+        // a downstream consumer). The box blur \be must still be applied on the
+        // CPU: mirror the non-deferred ass_synth_blur call below but pass
+        // r2x=r2y=0 so ONLY the box component runs now, with the same blur_bm
+        // gating (bm_o border is always blurred). The combined bitmaps were
+        // already allocated with ass_be_padding(be) room above, so the box blur
+        // has its padding. The gaussian is then applied last by the consumer, so
+        // the effective order becomes gaussian(be(coverage)) rather than the
+        // non-deferred be(gaussian(coverage)) -- unavoidable when the gaussian is
+        // deferred, and the box blur is a small edge filter. \blur-only (be==0)
+        // is untouched.
+        if (k->filter.be) {
+            if (blur_bm)
+                ass_synth_blur(&render_priv->engine, blur_pool, &v->bm, k->filter.be, 0, 0);
+            ass_synth_blur(&render_priv->engine, blur_pool, &v->bm_o, k->filter.be, 0, 0);
+        }
+        // Don't convolve the gaussian: just expand the bitmaps to the bounds the
+        // blur would produce, and record its std-dev so the consumer can apply it.
         if (r2x > 0.001 || r2y > 0.001) {
             if (blur_bm)
                 ass_blur_expand_only(&render_priv->engine, &v->bm, r2x, r2y);
@@ -3716,6 +3999,30 @@ static int ass_image_compare(ASS_Image *i1, ASS_Image *i2)
         return 2;
     if (i1->bitmap != i2->bitmap)
         return 2;
+    // Deferred-mode fields that change what the downstream consumer draws even
+    // when the coverage bitmap/blob and colour are unchanged: a \kf wipe
+    // advancing between frames only moves wipe_x; an animated \blur only moves
+    // blur_x/blur_y; \be and the rectangular clip likewise. Without these a
+    // consumer caching on "unchanged" serves stale karaoke/blur state.
+    // (run_id/clip_id are deliberately NOT compared: they are frame-scoped
+    // grouping ids whose numeric values may differ across frames with threaded
+    // rendering while the content is identical; a cached frame stays
+    // self-consistent.)
+    if (i1->blur_x != i2->blur_x || i1->blur_y != i2->blur_y)
+        return 2;
+    if (i1->run_flags != i2->run_flags)
+        return 2;
+    if (i1->outline != i2->outline || i1->n_outline != i2->n_outline)
+        return 2;
+    if (i1->clip_rx0 != i2->clip_rx0 || i1->clip_ry0 != i2->clip_ry0 ||
+        i1->clip_rx1 != i2->clip_rx1 || i1->clip_ry1 != i2->clip_ry1)
+        return 2;
+    if (i1->color2 != i2->color2 || i1->wipe_x != i2->wipe_x)
+        return 2;
+    if (i1->be != i2->be)
+        return 2;
+    if (i1->shift_x64 != i2->shift_x64 || i1->shift_y64 != i2->shift_y64)
+        return 2;
     if (i1->dst_x != i2->dst_x)
         return 1;
     if (i1->dst_y != i2->dst_y)
@@ -3867,6 +4174,8 @@ ASS_Image *ass_render_frame(ASS_Renderer *priv, ASS_Track *track,
             *detect_change = 2;
         return NULL;
     }
+
+    ass_atomic_store_uint(&priv->deferred_run_base, 0);  // frame-unique run ids
 
     // render events separately
     int cnt = 0;

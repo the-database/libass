@@ -110,9 +110,18 @@ static void run_claimed(ASS_ThreadPool *pool, TaskRegion *r, size_t idx,
     if (r->exclusive)
         tls_excl_depth--;
     tls_thread_id = saved;
-    size_t d = ass_atomic_inc_size(&r->done);
+    // Read count BEFORE the final increment: the moment done reaches count,
+    // the region's owner may unlink the region and return, and *r (which
+    // lives in the owner's stack frame) dies with it. Only pool-owned state
+    // may be touched from here on.
+    size_t count = r->count;
+    // Release: publish this task body's writes (rendered bitmaps, cache
+    // items, ...) to the region owner, whose load-acquire of done pairs with
+    // every incrementer via the RMW release sequence. Without this edge the
+    // owner's post-run reads of worker-produced data are a C11 data race.
+    size_t d = ass_atomic_inc_size_release(&r->done);
     ass_mutex_lock(&pool->lock);
-    if (d == r->count)
+    if (d == count)
         ass_cond_broadcast(&pool->cond);   // the region's owner may be waiting
 }
 
@@ -315,7 +324,11 @@ void ass_thread_pool_run(ASS_ThreadPool *pool, size_t count,
             run_claimed(pool, pr, idx, my_id);
             continue;
         }
-        if (ass_atomic_load_size(&r.done) == count)
+        // Acquire pairs with the workers' release increments: observing
+        // done == count makes every task body's writes visible before we
+        // unlink the region and let the caller consume the results (and
+        // before this stack frame -- holding the region -- is reused).
+        if (ass_atomic_load_size_acquire(&r.done) == count)
             break;
         ass_cond_wait(&pool->cond, &pool->lock);
     }
