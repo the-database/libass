@@ -30,10 +30,33 @@
  *       is deferred (blur_x/y>0) and \be is still applied. Needs a font dir
  *       only (for "Aileron"); the .ass corpus is ignored.
  *
- * Usage: int8k_harness [-t threads] [-m hash|outline|blurdefer] [-W w] [-H h] dir...
+ *   tilecmp mode (-m tilecmp; not compiled with -DINT8K_NO_OUTLINE):
+ *       GPU-filler divergence isolation (no GPU needed): renders the corpus
+ *       with outline_deferred, decodes every image's tile blob and rasterizes
+ *       each tile twice on the CPU:
+ *         ref16: the C tile fillers' exact int16 wraparound semantics
+ *                (rasterizer_template.h, TILE_ORDER 4) fed the blob's
+ *                pre-rescaled a/b/c -- bit-identical to libass's CPU coverage
+ *                (that equivalence is itself validated by -m tileself);
+ *         gpu32: a straight C port of vo_gpu_next.c's GLSL filler in plain
+ *                int32 arithmetic (as shipped before the WP-C5 fix).
+ *       Any differing pixel means the GLSL's 32-bit ints diverge from the
+ *       CPU's wrapping int16 arithmetic for that tile's segments.
+ *
+ *   tileself mode (-m tileself):
+ *       validates ref16 AND the blob encoding against the real CPU rasterizer:
+ *       builds synthetic outlines (long thin spikes at many angles, mimicking
+ *       steep 3D-perspective edges), rasterizes each directly with
+ *       ass_rasterizer_fill (C engine, 16px tiles), and again from its
+ *       ass_outline_to_tiles blob via ref16; the two coverage buffers must
+ *       match byte for byte. Self-contained (ignores the .ass corpus).
+ *
+ * Usage: int8k_harness [-t threads]
+ *        [-m hash|outline|blurdefer|tilecmp|tileself] [-W w] [-H h] dir...
  */
 
 #include <dirent.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,6 +66,8 @@
 #ifndef INT8K_NO_OUTLINE
 #include "../libass/ass_rasterizer.h"   /* TILE_EXPORT_W / SEG_EXPORT_W */
 #include "../libass/ass_types.h"
+#include "../libass/ass_outline.h"      /* tileself: synthetic outlines */
+#include "../libass/ass_bitmap_engine.h"
 #endif
 
 #define MAX_TIMES 64
@@ -321,12 +346,501 @@ static int run_blurdefer(ASS_Renderer *r, int fw, int fh)
     return fails != 0;
 }
 
+/* --- tilecmp / tileself modes ---------------------------------------------
+ *
+ * Two CPU rasterizations of an ass_outline_to_tiles blob:
+ *
+ *   ref16: the semantics of libass's C tile fillers (rasterizer_template.h,
+ *          TILE_ORDER 4). Their arithmetic lives in int16_t, so every store
+ *          wraps mod 2^16 -- and the wraps are REACHABLE: a segment clipped
+ *          to a 16px tile can carry |RESCALE_C| up to ~32768 and per-pixel
+ *          line-equation values up to ~(|a|+|b|)*16 + |c| ~ 64K. Steep long
+ *          edges (3D perspective) hit this; the SIMD fillers use 16-bit lanes
+ *          too, so the wrap IS the reference output.
+ *   gpu32: the GLSL filler of vo_gpu_next.c in plain int32 (no wrap).
+ *
+ * The blob's a/b/c are the CPU fillers' own RESCALE_AB/RESCALE_C results
+ * before their int16 truncation (exact in float32: |a|,|b| <= 2048,
+ * |c| <= ~32768), so ref16's int16 stores reproduce the truncation exactly.
+ */
+#ifndef INT8K_NO_OUTLINE
+
+#define TC_FULL 1024   /* FULL_VALUE at TILE_ORDER 4 */
+
+typedef struct {
+    int32_t a, b, c, flags, x_min, y_min, y_max;
+} TcSeg;
+
+static void tc_seg(const float *s, TcSeg *o)
+{
+    o->a = (int32_t) s[0]; o->b = (int32_t) s[1]; o->c = (int32_t) s[2];
+    o->flags = (int32_t) s[3]; o->x_min = (int32_t) s[4];
+    o->y_min = (int32_t) s[5]; o->y_max = (int32_t) s[6];
+}
+
+/* ---- ref16: rasterizer_template.h semantics (int16 wraps included) ------ */
+
+static void tc_ubl16(int16_t res[16], int16_t abs_a, const int16_t va[16],
+                     int16_t b, int16_t abs_b, int16_t c, int up, int dn)
+{
+    int16_t size = dn - up;
+    int16_t w = TC_FULL + (size << 4) - abs_a;
+    w = (w < TC_FULL ? w : TC_FULL) << 3;
+    int16_t dc_b = abs_b * (int32_t) size >> 6;
+    int16_t dc = ((abs_a < dc_b ? abs_a : dc_b) + 2) >> 2;
+    int16_t base = (int32_t) b * (int16_t) (up + dn) >> 7;
+    int16_t offs1 = size - ((base + dc) * (int32_t) w >> 16);
+    int16_t offs2 = size - ((base - dc) * (int32_t) w >> 16);
+    size <<= 1;
+    for (int x = 0; x < 16; x++) {
+        int16_t cw = (c - va[x]) * (int32_t) w >> 16;
+        int16_t c1 = cw + offs1, c2 = cw + offs2;
+        c1 = c1 < 0 ? 0 : c1 > size ? size : c1;
+        c2 = c2 < 0 ? 0 : c2 > size ? size : c2;
+        res[x] += c1 + c2;
+    }
+}
+
+static void tc_generic16(uint8_t buf[16][16], const TcSeg *segs, int n, int wind)
+{
+    int16_t res[16][16] = {{0}};
+    int16_t delta[16 + 2] = {0};
+    for (int i = 0; i < n; i++) {
+        const TcSeg *L = &segs[i];
+        int16_t up_delta = L->flags & SEGFLAG_DN ? 4 : 0;
+        int16_t dn_delta = up_delta;
+        if (!L->x_min && (L->flags & SEGFLAG_EXACT_LEFT))
+            dn_delta ^= 4;
+        if (L->flags & SEGFLAG_UL_DR) {
+            int16_t t = up_delta; up_delta = dn_delta; dn_delta = t;
+        }
+        int up = L->y_min >> 6, dn = L->y_max >> 6;
+        int16_t up_pos = L->y_min & 63;
+        int16_t up_delta1 = up_delta * up_pos;
+        int16_t dn_pos = L->y_max & 63;
+        int16_t dn_delta1 = dn_delta * dn_pos;
+        delta[up + 1] -= up_delta1;
+        delta[up] -= (up_delta << 6) - up_delta1;
+        delta[dn + 1] += dn_delta1;
+        delta[dn] += (dn_delta << 6) - dn_delta1;
+        if (L->y_min == L->y_max)
+            continue;
+
+        int16_t a = (int16_t) L->a, b = (int16_t) L->b;
+        int16_t c = L->c - (a >> 1) - b * up;   /* int16 store: wraps like C ref */
+        int16_t va[16];
+        for (int x = 0; x < 16; x++)
+            va[x] = a * x;
+        int16_t abs_a = a < 0 ? -a : a;
+        int16_t abs_b = b < 0 ? -b : b;
+        int16_t dc = ((abs_a < abs_b ? abs_a : abs_b) + 2) >> 2;
+        int16_t base = TC_FULL / 2 - (b >> 1);
+        int16_t dc1 = base + dc, dc2 = base - dc;
+
+        if (up_pos) {
+            if (dn == up) {
+                tc_ubl16(res[up], abs_a, va, b, abs_b, c, up_pos, dn_pos);
+                continue;
+            }
+            tc_ubl16(res[up], abs_a, va, b, abs_b, c, up_pos, 64);
+            up++;
+            c -= b;
+        }
+        for (int y = up; y < dn; y++) {
+            for (int x = 0; x < 16; x++) {
+                int16_t c1 = c - va[x] + dc1;
+                int16_t c2 = c - va[x] + dc2;
+                c1 = c1 < 0 ? 0 : c1 > TC_FULL ? TC_FULL : c1;
+                c2 = c2 < 0 ? 0 : c2 > TC_FULL ? TC_FULL : c2;
+                res[y][x] += (c1 + c2) >> 3;
+            }
+            c -= b;
+        }
+        if (dn_pos)
+            tc_ubl16(res[dn], abs_a, va, b, abs_b, c, 0, dn_pos);
+    }
+    int16_t cur = 256 * (int8_t) wind;
+    for (int y = 0; y < 16; y++) {
+        cur += delta[y];
+        for (int x = 0; x < 16; x++) {
+            int16_t val = res[y][x] + cur, neg = -val;
+            val = val > neg ? val : neg;
+            buf[y][x] = (uint8_t) (val < 255 ? val : 255);
+        }
+    }
+}
+
+static void tc_half16(uint8_t buf[16][16], int32_t a, int32_t b, int32_t c)
+{
+    int16_t aa = (int16_t) a, bb = (int16_t) b;
+    int16_t cc = c + TC_FULL / 2 - ((aa + bb) >> 1);   /* int16 store: wraps */
+    int16_t abs_a = aa < 0 ? -aa : aa;
+    int16_t abs_b = bb < 0 ? -bb : bb;
+    int16_t delta = ((abs_a < abs_b ? abs_a : abs_b) + 2) >> 2;
+    int16_t va1[16], va2[16];
+    for (int x = 0; x < 16; x++) {
+        va1[x] = aa * x - delta;
+        va2[x] = aa * x + delta;
+    }
+    for (int y = 0; y < 16; y++) {
+        for (int x = 0; x < 16; x++) {
+            int16_t c1 = cc - va1[x], c2 = cc - va2[x];
+            c1 = c1 < 0 ? 0 : c1 > TC_FULL ? TC_FULL : c1;
+            c2 = c2 < 0 ? 0 : c2 > TC_FULL ? TC_FULL : c2;
+            int16_t r = (c1 + c2) >> 3;
+            buf[y][x] = (uint8_t) (r < 255 ? r : 255);
+        }
+        cc -= bb;
+    }
+}
+
+/* one blob-tile group in ref16 semantics */
+static void tc_group16(uint8_t buf[16][16], int type, int wind,
+                       const TcSeg *segs, int n)
+{
+    if (type == 0) {
+        memset(buf, wind ? 255 : 0, 256);
+    } else if (type == 1) {
+        tc_half16(buf, segs[0].a, segs[0].b, segs[0].c);
+    } else {
+        tc_generic16(buf, segs, n, wind);
+    }
+}
+
+/* ---- gpu32: straight port of vo_gpu_next.c's GLSL filler (plain int32) -- */
+
+static int tc_ubl32(int px, int abs_a, int a, int b, int abs_b, int c,
+                    int up, int dn)
+{
+    int size = dn - up;
+    int w = 1024 + (size << 4) - abs_a;
+    w = (w < 1024 ? w : 1024) << 3;
+    int dc_b = (abs_b * size) >> 6;
+    int dc = ((abs_a < dc_b ? abs_a : dc_b) + 2) >> 2;
+    int base = (b * (up + dn)) >> 7;
+    int offs1 = size - (((base + dc) * w) >> 16);
+    int offs2 = size - (((base - dc) * w) >> 16);
+    int size2 = size * 2;
+    int cw = ((c - a * px) * w) >> 16;
+    int c1 = cw + offs1, c2 = cw + offs2;
+    c1 = c1 < 0 ? 0 : c1 > size2 ? size2 : c1;
+    c2 = c2 < 0 ? 0 : c2 > size2 ? size2 : c2;
+    return c1 + c2;
+}
+
+static int tc_pixel32(int type, int wind, const TcSeg *segs, int n,
+                      int lx, int ly)
+{
+    if (type == 0)
+        return wind ? 255 : 0;
+    if (type == 1) {
+        int aa = segs[0].a, bb = segs[0].b;
+        int cc = segs[0].c + 512 - ((aa + bb) >> 1) - bb * ly;
+        int abs_a = aa < 0 ? -aa : aa, abs_b = bb < 0 ? -bb : bb;
+        int dl = ((abs_a < abs_b ? abs_a : abs_b) + 2) >> 2;
+        int c1 = cc - aa * lx + dl, c2 = cc - aa * lx - dl;
+        c1 = c1 < 0 ? 0 : c1 > 1024 ? 1024 : c1;
+        c2 = c2 < 0 ? 0 : c2 > 1024 ? 1024 : c2;
+        int v = (c1 + c2) >> 3;
+        return v < 255 ? v : 255;
+    }
+    int res = 0, cur = 256 * wind;
+    for (int i = 0; i < n; i++) {
+        int a = segs[i].a, b = segs[i].b, c0 = segs[i].c;
+        int flags = segs[i].flags, xmin = segs[i].x_min;
+        int ymn = segs[i].y_min, ymx = segs[i].y_max;
+        int upd = (flags & 1) ? 4 : 0, dnd = upd;
+        if (xmin == 0 && (flags & 4))
+            dnd = 4 - dnd;
+        if (flags & 2) { int t = upd; upd = dnd; dnd = t; }
+        int up = ymn >> 6, dn = ymx >> 6, upp = ymn & 63, dnp = ymx & 63;
+        if (up     <= ly) cur -= (upd << 6) - upd * upp;
+        if (up + 1 <= ly) cur -= upd * upp;
+        if (dn     <= ly) cur += (dnd << 6) - dnd * dnp;
+        if (dn + 1 <= ly) cur += dnd * dnp;
+        if (ymn == ymx)
+            continue;
+        int abs_a = a < 0 ? -a : a, abs_b = b < 0 ? -b : b;
+        int dc = ((abs_a < abs_b ? abs_a : abs_b) + 2) >> 2;
+        int base = 512 - (b >> 1);
+        int c = c0 - (a >> 1) - b * up, rup = up;
+        if (upp != 0) {
+            if (dn == up) {
+                if (ly == up)
+                    res += tc_ubl32(lx, abs_a, a, b, abs_b, c, upp, dnp);
+                continue;
+            }
+            if (ly == up)
+                res += tc_ubl32(lx, abs_a, a, b, abs_b, c, upp, 64);
+            rup = up + 1;
+            c -= b;
+        }
+        if (ly >= rup && ly < dn) {
+            int cy = c - b * (ly - rup);
+            int c1 = cy - a * lx + base + dc;
+            int c2 = cy - a * lx + base - dc;
+            c1 = c1 < 0 ? 0 : c1 > 1024 ? 1024 : c1;
+            c2 = c2 < 0 ? 0 : c2 > 1024 ? 1024 : c2;
+            res += (c1 + c2) >> 3;
+        }
+        if (dnp != 0 && ly == dn) {
+            int cy = c - b * (dn - rup);
+            res += tc_ubl32(lx, abs_a, a, b, abs_b, cy, 0, dnp);
+        }
+    }
+    int val = res + cur, neg = -val;
+    val = val > neg ? val : neg;
+    return val < 255 ? val : 255;
+}
+
+static void tc_group32(uint8_t buf[16][16], int type, int wind,
+                       const TcSeg *segs, int n)
+{
+    for (int y = 0; y < 16; y++)
+        for (int x = 0; x < 16; x++)
+            buf[y][x] = (uint8_t) tc_pixel32(type, wind, segs, n, x, y);
+}
+
+/* Rasterize one blob tile (<=2 groups, max-merged) with a group filler. */
+typedef void (*tc_group_fn)(uint8_t buf[16][16], int type, int wind,
+                            const TcSeg *segs, int n);
+
+static void tc_tile(tc_group_fn fn, const float *tile, const float *segpool,
+                    uint8_t out[16][16])
+{
+    int ng = (int) tile[2];
+    for (int g = 0; g < ng && g < 2; g++) {
+        const float *G = tile + 3 + 4 * g;
+        int type = (int) G[0], wind = (int) G[1];
+        int soff = (int) G[2], scnt = (int) G[3];
+        TcSeg sbuf[64], *segs = sbuf;
+        if (scnt > 64 && !(segs = malloc((size_t) scnt * sizeof(TcSeg))))
+            return;
+        int n = scnt;
+        for (int i = 0; i < n; i++)
+            tc_seg(segpool + (size_t) (soff + i) * SEG_EXPORT_W, &segs[i]);
+        uint8_t tmp[16][16];
+        fn(tmp, type, wind, segs, n);
+        if (segs != sbuf)
+            free(segs);
+        if (g == 0) {
+            memcpy(out, tmp, 256);
+        } else {
+            for (int y = 0; y < 16; y++)
+                for (int x = 0; x < 16; x++)
+                    out[y][x] = out[y][x] > tmp[y][x] ? out[y][x] : tmp[y][x];
+        }
+    }
+    if (!ng)
+        memset(out, 0, 256);
+}
+
+/* Reconstruct a whole glyph coverage buffer (bw x bh, stride bw) from a blob. */
+static void tc_blob_fill(tc_group_fn fn, const int32_t *blob,
+                         int bw, int bh, uint8_t *out)
+{
+    int nt = blob[0];
+    const float *tiles = (const float *) (blob + 2);
+    const float *segpool = tiles + (size_t) nt * TILE_EXPORT_W;
+    for (int t = 0; t < nt; t++) {
+        const float *T = tiles + (size_t) t * TILE_EXPORT_W;
+        int tx = (int) T[0], ty = (int) T[1];
+        uint8_t cov[16][16];
+        tc_tile(fn, T, segpool, cov);
+        for (int y = 0; y < 16 && ty + y < bh; y++)
+            for (int x = 0; x < 16 && tx + x < bw; x++)
+                out[(size_t) (ty + y) * bw + tx + x] = cov[y][x];
+    }
+}
+
+static int run_tilecmp(ASS_Renderer *r, ASS_Track *track, const char *name)
+{
+    long long times[MAX_TIMES];
+    int nt = collect_times(track, times);
+    long long images = 0, tiles = 0, diff_tiles = 0, diff_px = 0;
+    int maxdiff = 0, shown = 0;
+    for (int i = 0; i < nt; i++) {
+        ASS_Image *img = ass_render_frame(r, track, times[i], NULL);
+        for (ASS_Image *im = img; im; im = im->next) {
+            if (!im->outline || im->n_outline < 2)
+                continue;
+            images++;
+            const int32_t *blob = im->outline;
+            int n_tiles = blob[0];
+            const float *tarr = (const float *) (blob + 2);
+            const float *segpool = tarr + (size_t) n_tiles * TILE_EXPORT_W;
+            for (int t = 0; t < n_tiles; t++) {
+                const float *T = tarr + (size_t) t * TILE_EXPORT_W;
+                int tx = (int) T[0], ty = (int) T[1];
+                uint8_t c16[16][16], c32[16][16];
+                tc_tile(tc_group16, T, segpool, c16);
+                tc_tile(tc_group32, T, segpool, c32);
+                tiles++;
+                int tile_diff = 0;
+                for (int y = 0; y < 16 && ty + y < im->h; y++)
+                    for (int x = 0; x < 16 && tx + x < im->w; x++) {
+                        int d = (int) c16[y][x] - (int) c32[y][x];
+                        if (d < 0)
+                            d = -d;
+                        if (d) {
+                            tile_diff++;
+                            if (d > maxdiff)
+                                maxdiff = d;
+                            if (shown < 8) {
+                                shown++;
+                                printf("TILECMP-DIFF %s t=%lld img w=%d h=%d "
+                                       "tile(%d,%d) px(%d,%d) ref16=%d gpu32=%d "
+                                       "ng=%d g0=(type %d wind %d nseg %d)\n",
+                                       name, times[i], im->w, im->h, tx, ty,
+                                       x, y, c16[y][x], c32[y][x], (int) T[2],
+                                       (int) T[3], (int) T[4], (int) T[6]);
+                            }
+                        }
+                    }
+                if (tile_diff) {
+                    diff_tiles++;
+                    diff_px += tile_diff;
+                }
+            }
+        }
+    }
+    printf("TILECMP %s: %lld images, %lld tiles, %lld diff-tiles, "
+           "%lld diff-px, maxdiff %d -> %s\n", name, images, tiles,
+           diff_tiles, diff_px, maxdiff, diff_tiles ? "DIVERGES" : "MATCHES");
+    return 0;   /* informational: divergence is the finding, not a failure */
+}
+
+/* ---- tileself: ref16 + blob encoding vs the real CPU rasterizer --------- */
+
+#define TS_RASTERIZER_PRECISION 16   /* == ass_render.c RASTERIZER_PRECISION */
+
+static long long ts_gpu32_diverged;   /* informational: gpu32 vs direct */
+
+static int ts_check_outline(const ASS_Outline *ol, const char *what,
+                            long long *n_bytes)
+{
+    float *tiles = NULL, *segs = NULL;
+    int n_tiles = 0, n_segs = 0;
+    int32_t left, top, w, h;
+    if (!ass_outline_to_tiles(ol, NULL, TS_RASTERIZER_PRECISION, &tiles,
+                              &n_tiles, &segs, &n_segs, &left, &top, &w, &h)) {
+        printf("TILESELF %s: empty export\n", what);
+        return 1;
+    }
+    int tw = (w + 15) & ~15, th = (h + 15) & ~15;
+
+    /* direct: the real CPU engine over the same window */
+    BitmapEngine eng = ass_bitmap_engine_init(0);
+    RasterizerData rst;
+    uint8_t *direct = NULL, *from_blob = NULL;
+    int32_t *blob = NULL;
+    int rc = 1;
+    if (!ass_rasterizer_init(&eng, &rst, TS_RASTERIZER_PRECISION))
+        goto done;
+    if (!ass_rasterizer_set_outline(&rst, ol, false)) {
+        ass_rasterizer_done(&rst);
+        goto done;
+    }
+    direct = aligned_alloc(32, (size_t) tw * th);
+    from_blob = calloc(1, (size_t) tw * th);
+    if (!direct || !from_blob ||
+        !ass_rasterizer_fill(&eng, &rst, direct, left, top, tw, th, tw)) {
+        ass_rasterizer_done(&rst);
+        goto done;
+    }
+    ass_rasterizer_done(&rst);
+
+    /* blob -> ref16 over the full tile grid (tw x th) */
+    size_t total = 2 + (size_t) n_tiles * TILE_EXPORT_W
+                     + (size_t) n_segs * SEG_EXPORT_W;
+    blob = malloc(total * sizeof(int32_t));
+    if (!blob)
+        goto done;
+    blob[0] = n_tiles;
+    blob[1] = n_segs;
+    memcpy(blob + 2, tiles, (size_t) n_tiles * TILE_EXPORT_W * sizeof(float));
+    memcpy(blob + 2 + (size_t) n_tiles * TILE_EXPORT_W, segs,
+           (size_t) n_segs * SEG_EXPORT_W * sizeof(float));
+    tc_blob_fill(tc_group16, blob, tw, th, from_blob);
+
+    long long bad = 0;
+    for (size_t k = 0; k < (size_t) tw * th; k++)
+        if (direct[k] != from_blob[k]) {
+            if (!bad)
+                printf("TILESELF %s: first mismatch at (%d,%d): "
+                       "direct=%d ref16=%d\n", what, (int) (k % tw),
+                       (int) (k / tw), direct[k], from_blob[k]);
+            bad++;
+        }
+    *n_bytes += (long long) tw * th;
+
+    /* informational: does the shipped int32 GLSL port reach the CPU's int16
+     * wraparound cases on this synthetic steep content? */
+    memset(from_blob, 0, (size_t) tw * th);
+    tc_blob_fill(tc_group32, blob, tw, th, from_blob);
+    for (size_t k = 0; k < (size_t) tw * th; k++)
+        if (direct[k] != from_blob[k])
+            ts_gpu32_diverged++;
+    if (bad)
+        printf("TILESELF %s: %dx%d, %lld MISMATCHED bytes -> FAIL\n",
+               what, tw, th, bad);
+    rc = bad != 0;
+done:
+    free(direct);
+    free(from_blob);
+    free(blob);
+    free(tiles);
+    free(segs);
+    return rc;
+}
+
+static int run_tileself(void)
+{
+    /* Long thin spikes from a center at many angles: every spike edge is a
+     * long steep segment; across angles this sweeps the full range of tile
+     * line-equation coefficients (incl. the int16-wrapping corner cases that
+     * 3D perspective produces). Coordinates in 1/64 px. */
+    int fails = 0;
+    long long checked = 0;
+    ASS_Vector pts[3 * 720];
+    char segs[3 * 720];
+    for (int pass = 0; pass < 3; pass++) {
+        double cx = 200.5 * 64, cy = 150.25 * 64;
+        double rad = (pass == 0 ? 120 : pass == 1 ? 300 : 37.3) * 64;
+        double thin = pass == 2 ? 0.001 : 0.013;   /* spike half-angle (rad) */
+        int n = 0;
+        int nspikes = pass == 1 ? 720 : 180;
+        for (int k = 0; k < nspikes; k++) {
+            double th = k * (2 * 3.14159265358979 / nspikes) + 0.0007 * pass;
+            pts[n] = (ASS_Vector) { (int) cx, (int) cy };
+            segs[n++] = OUTLINE_LINE_SEGMENT;
+            pts[n] = (ASS_Vector) { (int) (cx + rad * cos(th - thin)),
+                                    (int) (cy + rad * sin(th - thin)) };
+            segs[n++] = OUTLINE_LINE_SEGMENT;
+            pts[n] = (ASS_Vector) { (int) (cx + rad * cos(th + thin)),
+                                    (int) (cy + rad * sin(th + thin)) };
+            segs[n++] = OUTLINE_LINE_SEGMENT | OUTLINE_CONTOUR_END;
+        }
+        ASS_Outline ol = { .points = pts, .segments = segs,
+                           .n_points = n, .n_segments = n };
+        char what[64];
+        snprintf(what, sizeof(what), "spikes-pass%d", pass);
+        fails += ts_check_outline(&ol, what, &checked);
+    }
+    printf("TILESELF: %lld bytes compared, %d failures -> %s "
+           "(gpu32-vs-direct diverged bytes: %lld)\n",
+           checked, fails, fails ? "FAIL" : "PASS", ts_gpu32_diverged);
+    return fails != 0;
+}
+
+#endif /* !INT8K_NO_OUTLINE */
+
 /* ------------------------------------------------------------------------- */
 
 int main(int argc, char **argv)
 {
     int threads = -1, fw = 1280, fh = 720;
-    int mode = 0;   /* 0 = hash, 1 = outline, 2 = blurdefer */
+    int mode = 0;   /* 0=hash 1=outline 2=blurdefer 3=tilecmp 4=tileself */
     int argi = 1;
     for (; argi < argc && argv[argi][0] == '-'; argi++) {
         if (!strcmp(argv[argi], "-t") && argi + 1 < argc)
@@ -338,20 +852,27 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[argi], "-m") && argi + 1 < argc) {
             const char *mv = argv[++argi];
             mode = !strcmp(mv, "outline")   ? 1 :
-                   !strcmp(mv, "blurdefer") ? 2 : 0;
+                   !strcmp(mv, "blurdefer") ? 2 :
+                   !strcmp(mv, "tilecmp")   ? 3 :
+                   !strcmp(mv, "tileself")  ? 4 : 0;
         } else {
             fprintf(stderr, "unknown option '%s'\n", argv[argi]);
             return 2;
         }
     }
+#ifndef INT8K_NO_OUTLINE
+    if (mode == 4)   /* self-contained; needs no corpus, fonts or renderer */
+        return run_tileself();
+#endif
     if (argi >= argc) {
-        fprintf(stderr, "usage: %s [-t threads] [-m hash|outline|blurdefer] "
+        fprintf(stderr, "usage: %s [-t threads] "
+                        "[-m hash|outline|blurdefer|tilecmp|tileself] "
                         "[-W w] [-H h] dir...\n", argv[0]);
         return 2;
     }
 #ifdef INT8K_NO_OUTLINE
-    if (mode == 1) {
-        fprintf(stderr, "outline mode not compiled in\n");
+    if (mode == 1 || mode == 3 || mode == 4) {
+        fprintf(stderr, "outline modes not compiled in\n");
         return 2;
     }
 #endif
@@ -374,7 +895,7 @@ int main(int argc, char **argv)
     if (threads >= 0)
         ass_set_render_thread_count(r, threads);
 #ifndef INT8K_NO_OUTLINE
-    if (mode == 1)
+    if (mode == 1 || mode == 3)
         ass_set_outline_deferred(r, 1);
 #endif
 
@@ -415,6 +936,8 @@ int main(int argc, char **argv)
 #ifndef INT8K_NO_OUTLINE
             if (mode == 1)
                 rc |= run_outline(r, track, names[i]);
+            else if (mode == 3)
+                rc |= run_tilecmp(r, track, names[i]);
             else
 #endif
                 rc |= run_hash(r, track, names[i], fw, fh);
