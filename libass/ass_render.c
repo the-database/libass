@@ -534,6 +534,9 @@ static ASS_Image **render_shadow_deferred(CombinedBitmapInfo *info, uint32_t run
     // The shadow is the SOLID silhouette: emit both the fill and the border (a
     // ring) into one run -- they combine (saturating) to the filled dilated
     // shape, matching libass's bm_s (derived from the border before fix_outline).
+    // \be is inherited: the CPU copies bm_s from bm/bm_o AFTER ass_synth_blur,
+    // so the shadow coverage carries the same box-blur iterations.
+    int be = info->filter.be;
     for (size_t j = 0; j < info->bitmap_count; j++) {
         BitmapRef *ref = &info->bitmaps[j];
         for (int o = 0; o < 2; o++) {
@@ -544,7 +547,7 @@ static ASS_Image **render_shadow_deferred(CombinedBitmapInfo *info, uint32_t run
             ASS_Image *im = my_draw_glyph(bm, info->x + pos.x + sx, info->y + pos.y + sy,
                                           color, IMAGE_TYPE_CHARACTER, bx, by, run_id,
                                           RUN_FLAG_SHADOW | (rect_inverse ? RUN_FLAG_RECT_INVERSE : 0),
-                                          clip_id, rcx0, rcy0, rcx1, rcy1, color, 0, 0);
+                                          clip_id, rcx0, rcy0, rcx1, rcy1, color, 0, be);
             if (im) {
                 *tail = im;
                 tail = &im->next;
