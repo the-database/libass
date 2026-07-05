@@ -491,8 +491,12 @@ static ASS_Image **render_run_deferred(CombinedBitmapInfo *info, bool outline,
     if (!outline && !blur_fill)
         bx = by = 0.0;
     // \be edge-blur: the consumer runs `be` iterations of the [1,2,1]/4 box on
-    // the GPU coverage (no bitmap here to run the CPU be_blur on).
+    // the GPU coverage (no bitmap here to run the CPU be_blur on). Gated like
+    // the gaussian above: ass_composite_construct's blur_bm applies \be to the
+    // fill only when there is no (nonzero) border; the border always gets it.
     int be = info->filter.be;
+    if (!outline && !blur_fill)
+        be = 0;
     for (size_t j = 0; j < info->bitmap_count; j++) {
         BitmapRef *ref = &info->bitmaps[j];
         Bitmap *bm = outline ? ref->bm_o : ref->bm;
@@ -3959,6 +3963,28 @@ static int ass_image_compare(ASS_Image *i1, ASS_Image *i2)
     if (i1->color != i2->color)
         return 2;
     if (i1->bitmap != i2->bitmap)
+        return 2;
+    // Deferred-mode fields that change what the downstream consumer draws even
+    // when the coverage bitmap/blob and colour are unchanged: a \kf wipe
+    // advancing between frames only moves wipe_x; an animated \blur only moves
+    // blur_x/blur_y; \be and the rectangular clip likewise. Without these a
+    // consumer caching on "unchanged" serves stale karaoke/blur state.
+    // (run_id/clip_id are deliberately NOT compared: they are frame-scoped
+    // grouping ids whose numeric values may differ across frames with threaded
+    // rendering while the content is identical; a cached frame stays
+    // self-consistent.)
+    if (i1->blur_x != i2->blur_x || i1->blur_y != i2->blur_y)
+        return 2;
+    if (i1->run_flags != i2->run_flags)
+        return 2;
+    if (i1->outline != i2->outline || i1->n_outline != i2->n_outline)
+        return 2;
+    if (i1->clip_rx0 != i2->clip_rx0 || i1->clip_ry0 != i2->clip_ry0 ||
+        i1->clip_rx1 != i2->clip_rx1 || i1->clip_ry1 != i2->clip_ry1)
+        return 2;
+    if (i1->color2 != i2->color2 || i1->wipe_x != i2->wipe_x)
+        return 2;
+    if (i1->be != i2->be)
         return 2;
     if (i1->dst_x != i2->dst_x)
         return 1;
