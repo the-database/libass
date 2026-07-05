@@ -171,6 +171,23 @@ typedef struct ass_image {
     // Outline-mode \be edge-blur: the consumer applies `be` iterations of the
     // [1,2,1]/4 box to this run's coverage (0 = none).
     int32_t be;
+
+    // Outline-mode deferred drop shadow (run_flags bit 5, RUN_FLAG_SHADOW):
+    // the sub-pixel fraction of the run's shadow offset, in 1/64ths of a
+    // pixel (0..63 per axis; 0/0 on all other images = no shift). dst_x/dst_y
+    // already contain the offset's integer part, floored exactly like the
+    // CPU's `bm_s.left += shadow.x >> 6` (before these fields existed the
+    // offset was rounded to the nearest pixel instead). The consumer must
+    // replicate ass_shift_bitmap's fixed-point bilinear smear on the run's
+    // final 8-bit coverage, AFTER the deferred gaussian blur and \be (the CPU
+    // copies bm_s from the already-blurred coverage, then shifts), exactly:
+    //   t(x,y)   = C(x,y) - (C(x,y)*shift_x64 >> 6) + (C(x-1,y)*shift_x64 >> 6)
+    //   out(x,y) = t(x,y) - (t(x,y)*shift_y64 >> 6) + (t(x,y-1)*shift_y64 >> 6)
+    // with C() the 0..255 coverage (0 outside the image) and truncating
+    // integer shifts. Coverage never reaches an image's last pixel column/row
+    // (the rasterization bbox keeps >= 1px of empty right/bottom slack, which
+    // blur expansion preserves), so the smear never spills past w/h.
+    int32_t shift_x64, shift_y64;
 } ASS_Image;
 
 /*

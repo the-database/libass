@@ -367,6 +367,7 @@ static ASS_Image *my_draw_bitmap(unsigned char *bitmap, int bitmap_w,
     img->result.color2 = color;
     img->result.wipe_x = 0;
     img->result.be = 0;
+    img->result.shift_x64 = img->result.shift_y64 = 0;
 
     img->source = source;
     ass_cache_inc_ref(source);
@@ -436,6 +437,7 @@ static ASS_Image *my_draw_glyph(Bitmap *bm, int dst_x, int dst_y,
     img->result.run_flags = run_flags;
     img->result.outline = bm->segments;    // outline-deferred: GPU rasterizes these
     img->result.n_outline = bm->n_segments;
+    img->result.shift_x64 = img->result.shift_y64 = 0;  // set by the shadow emitter
     img->source = (CompositeHashValue *) bm;
     ass_cache_inc_ref(bm);
     img->buffer = NULL;
@@ -516,8 +518,10 @@ static ASS_Image **render_run_deferred(CombinedBitmapInfo *info, bool outline,
 
 // Deferred shadow: emit each glyph's border (or fill) coverage shifted by the
 // run's shadow offset, in the shadow colour, as its own coverage run (run_id).
-// Emitted before the fill/border runs so it composites behind them. Sub-pixel
-// shadow offset is rounded to whole px (shadows are soft -- visually identical).
+// Emitted before the fill/border runs so it composites behind them. The offset
+// splits exactly like the CPU's (ass_composite_construct): integer part into
+// dst_x/dst_y ('>>' floors), sub-pixel remainder (0..63, 1/64 px) into
+// shift_x64/shift_y64 for the consumer's ass_shift_bitmap-equivalent smear.
 static ASS_Image **render_shadow_deferred(CombinedBitmapInfo *info, uint32_t run_id,
                                           uint32_t clip_id,
                                           int32_t rcx0, int32_t rcy0,
@@ -525,8 +529,12 @@ static ASS_Image **render_shadow_deferred(CombinedBitmapInfo *info, uint32_t run
                                           bool rect_inverse, ASS_Image **tail)
 {
     uint32_t color = info->c[3];
-    int sx = lround(info->filter.shadow.x / 64.0);
-    int sy = lround(info->filter.shadow.y / 64.0);
+    // Works right even for negative offsets: '>>' rounds toward negative
+    // infinity and '&' returns the correct (non-negative) remainder.
+    int sx = info->filter.shadow.x >> 6;
+    int sy = info->filter.shadow.y >> 6;
+    int fx = info->filter.shadow.x & SUBPIXEL_MASK;
+    int fy = info->filter.shadow.y & SUBPIXEL_MASK;
     double bx = restore_blur(info->filter.blur_x);
     double by = restore_blur(info->filter.blur_y);
     bx = bx > 0.001 ? sqrt(bx) : 0.0;
@@ -557,6 +565,8 @@ static ASS_Image **render_shadow_deferred(CombinedBitmapInfo *info, uint32_t run
                                       RUN_FLAG_SHADOW | (rect_inverse ? RUN_FLAG_RECT_INVERSE : 0),
                                       clip_id, rcx0, rcy0, rcx1, rcy1, color, 0, be);
         if (im) {
+            im->shift_x64 = fx;
+            im->shift_y64 = fy;
             *tail = im;
             tail = &im->next;
         }
@@ -4010,6 +4020,8 @@ static int ass_image_compare(ASS_Image *i1, ASS_Image *i2)
     if (i1->color2 != i2->color2 || i1->wipe_x != i2->wipe_x)
         return 2;
     if (i1->be != i2->be)
+        return 2;
+    if (i1->shift_x64 != i2->shift_x64 || i1->shift_y64 != i2->shift_y64)
         return 2;
     if (i1->dst_x != i2->dst_x)
         return 1;
