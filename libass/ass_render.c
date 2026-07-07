@@ -1251,9 +1251,17 @@ static ASS_Image *render_text(RenderContext *state)
         CombinedBitmapInfo *info = &bitmaps[i];
         if (info->deferred) {
             // Outline mode: shadow coverage isn't on the CPU; emit it as its own
-            // run, behind the fill/border (drawn next).
+            // run, behind the fill/border (drawn next). Gate on FILTER_NONZERO_SHADOW
+            // (the CPU's own condition for building bm_s in ass_composite_construct),
+            // NOT on filter.shadow.x/y: those are the blur-QUANTIZED offset, which
+            // rounds a sub-quantum shadow (e.g. \shad0.1 under \blur) down to (0,0)
+            // while the flag stays set. The CPU still draws that zero-offset shadow;
+            // gating the deferred run on the quantized offset dropped it, so the GPU
+            // path was missing the whole shadow layer (kobayashi \shad0.1 signs).
+            // A zero offset emits sx=sy=0, shift_x64=shift_y64=0 -> coincident with
+            // the silhouette, no sub-pixel smear: exactly what the CPU renders.
             if (state->border_style != 4 &&
-                (info->filter.shadow.x || info->filter.shadow.y))
+                (info->filter.flags & FILTER_NONZERO_SHADOW))
                 tail = render_shadow_deferred(info, run_base + n_bitmaps + i + 1,
                                               clip_id, rcx0, rcy0, rcx1, rcy1,
                                               rect_inverse, tail);
@@ -1283,7 +1291,7 @@ static ASS_Image *render_text(RenderContext *state)
                     (info->filter.flags & FILTER_BORDER_STYLE_3) &&
                     !(info->filter.flags & FILTER_NONZERO_BORDER) &&
                     state->border_style != 4 &&
-                    (info->filter.shadow.x || info->filter.shadow.y);
+                    (info->filter.flags & FILTER_NONZERO_SHADOW);
             if (!ko_unsung && !bs3_shadow_box)
                 tail = render_run_deferred(info, true, run_base + i + 1, clip_id,
                                            rcx0, rcy0, rcx1, rcy1, rect_inverse, tail);
