@@ -4223,11 +4223,20 @@ ASS_Image *ass_render_frame(ASS_Renderer *priv, ASS_Track *track,
         fix_collisions(priv, last, priv->eimg + cnt - last);
 
     // concat lists, removing fully transparent bitmaps
+    // In the deferred-composite modes the images are a scene DESCRIPTION, not
+    // final pixels: a fully transparent fill image still carries the coverage
+    // the downstream consumer's fix_outline needs (the CPU path subtracts the
+    // fill from the border inside ass_composite_construct BEFORE this cull;
+    // the deferred path moves that subtraction to the consumer, so dropping
+    // the image here turns a bordered run's ring into a full silhouette).
+    // Keep them: the consumer composites a 0xFF-alpha colour as fully
+    // transparent, so the visible output is unchanged.
+    bool keep_transparent = priv->composite_deferred;
     ASS_Image **tail = &priv->images_root;
     for (int i = 0; i < cnt; i++) {
         ASS_Image *cur = priv->eimg[i].imgs;
         while (cur) {
-            if (_a(cur->color) == 0xFF) {
+            if (_a(cur->color) == 0xFF && !keep_transparent) {
                 cur = ass_free_image(cur);
                 continue;
             }
