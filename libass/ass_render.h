@@ -383,8 +383,6 @@ typedef struct {
 } Rect;
 
 void ass_reset_render_context(RenderContext *state, ASS_Style *style);
-void ass_frame_ref(ASS_Image *img);
-void ass_frame_unref(ASS_Image *img);
 #if CONFIG_THREADS
 void ass_renderer_update_pool(ASS_Renderer *priv);
 #endif

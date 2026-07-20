@@ -579,6 +579,37 @@ void ass_set_composite_deferred(ASS_Renderer *priv, int deferred);
 void ass_set_outline_deferred(ASS_Renderer *priv, int deferred);
 
 /**
+ * \brief Add a reference to a frame image list.
+ *
+ * By default the list returned by ass_render_frame() is owned by the renderer
+ * and is valid only until the next ass_render_frame() call on it. Taking a
+ * reference extends that: the list -- and everything it points at, including
+ * each image's ASS_Image.bitmap and ASS_Image.outline -- stays valid and
+ * unchanged until the matching ass_frame_unref().
+ *
+ * The underlying glyph bitmaps live in the renderer's caches, and a referenced
+ * image pins the cache entry that owns its data, so the data survives cache
+ * eviction, an explicit cache flush, and even ass_renderer_done(): destruction
+ * is deferred to the last reference. This lets a consumer hand libass's own
+ * buffers to a later stage (another thread, a GPU upload queued for a future
+ * frame) without copying them.
+ *
+ * \param img image list returned by ass_render_frame()
+ */
+void ass_frame_ref(ASS_Image *img);
+
+/**
+ * \brief Release a reference to a frame image list.
+ *
+ * Drops a reference taken with ass_frame_ref(). The list is freed once the
+ * renderer and all reference holders have released it. Safe to call from any
+ * thread, and safe to call after ass_renderer_done().
+ *
+ * \param img image list returned by ass_render_frame()
+ */
+void ass_frame_unref(ASS_Image *img);
+
+/**
  * \brief Set shaping level. This is merely a hint, the renderer will use
  * whatever is available if the request cannot be fulfilled.
  * \param level shaping level
