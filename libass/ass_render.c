@@ -20,6 +20,7 @@
 #include "ass_compat.h"
 
 #include <assert.h>
+#include <stdlib.h>   // WP-K1 probe: getenv
 #include <math.h>
 #include <string.h>
 #include <stdbool.h>
@@ -3729,6 +3730,32 @@ static void check_cache_limits(ASS_Renderer *priv, CacheStore *cache)
     ass_cache_cut(cache->composite_cache, cache->composite_max_size);
     ass_cache_cut(cache->bitmap_cache, cache->bitmap_max_size);
     ass_cache_cut(cache->outline_cache, cache->glyph_max);
+
+    // WP-K1 probe branch: dump per-cache hits/misses/evictions/live-size once a
+    // frame when LIBASS_K1_CACHESTATS is set. Counters are cumulative, so take
+    // deltas across a measurement window. Fields:
+    //   <name>=<hits>/<misses>/<evictions>/<live_bytes>/<limit_bytes>
+    if (getenv("LIBASS_K1_CACHESTATS")) {
+        static const char *names[] = { "outline", "bitmap", "composite",
+                                       "font", "facesize", "metrics" };
+        Cache *cs[] = { cache->outline_cache, cache->bitmap_cache,
+                        cache->composite_cache, cache->font_cache,
+                        cache->face_size_metrics_cache, cache->metrics_cache };
+        size_t maxes[] = { cache->glyph_max, cache->bitmap_max_size,
+                           cache->composite_max_size, 0, 0, 0 };
+        size_t n_shards = 0;
+        char buf[512];
+        int n = snprintf(buf, sizeof(buf), "K1CACHESTATS");
+        for (size_t i = 0; i < 6 && n > 0 && n < (int) sizeof(buf); i++) {
+            unsigned long long h = 0, m = 0, e = 0;
+            size_t sz = 0;
+            if (cs[i])
+                ass_cache_stats(cs[i], &h, &m, &e, &sz, &n_shards);
+            n += snprintf(buf + n, sizeof(buf) - n, " %s=%llu/%llu/%llu/%zu/%zu",
+                          names[i], h, m, e, sz, maxes[i]);
+        }
+        fprintf(stderr, "%s shards=%zu\n", buf, n_shards);
+    }
 }
 
 static void setup_shaper(ASS_Shaper *shaper, ASS_Renderer *render_priv)

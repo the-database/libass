@@ -24,6 +24,7 @@
 #include <ft2build.h>
 #include FT_OUTLINE_H
 #include <assert.h>
+#include <stdlib.h>   // WP-K1 probe: getenv
 
 #include "ass_utils.h"
 #include "ass_font.h"
@@ -364,10 +365,42 @@ typedef struct cache_shard {
     size_t cache_size;
 } CacheShard;
 
+// ---------------------------------------------------------------------------
+// WP-K1 PROBE BRANCH -- NOT A MERGE CANDIDATE.
+//
+// Runtime toggle so a single binary can measure both states, interleaved:
+//
+//   LIBASS_K1_SHARDPROBE=1  -> all keys funnel into shard 0, so ass_cache_cut()
+//                              enforces the FULL size limit against ONE shard
+//                              (global-LRU semantics, equivalent to a build with
+//                              N_CACHE_SHARDS=1).
+//   unset / 0               -> stock behaviour: 64 shards, each cut to
+//                              max_size / 64.
+//
+// The hypothesis under test: at 8K a single composite/bitmap item exceeds a
+// shard's max_size/64 quota, so it is evicted and rebuilt every frame while the
+// cache as a whole sits far below its limit.
+//
+// Read once per cache at construction so it cannot change under running
+// workers. Deliberately crude: probe mode serialises every cache op on one
+// mutex and will show contention under --sub-ass-render-threads. That is
+// acceptable for a probe and is exactly what the real fix must avoid.
+// ---------------------------------------------------------------------------
 struct cache {
     const CacheDesc *desc;
+    size_t shard_mask;   // N_CACHE_SHARDS-1 normally, 0 in probe mode
     CacheShard shards[N_CACHE_SHARDS];
+    ass_atomic_size_t st_hits, st_misses, st_evictions;
 };
+
+// Stats are compiled IN unconditionally on this branch.
+#define STAT_BUMP(c, f) ass_atomic_inc_size(&(c)->f)
+
+static bool k1_shardprobe_enabled(void)
+{
+    const char *v = getenv("LIBASS_K1_SHARDPROBE");
+    return v && *v && *v != '0';
+}
 
 #define CACHE_ALIGN 8
 #define CACHE_ITEM_SIZE ((sizeof(CacheItem) + (CACHE_ALIGN - 1)) & ~(CACHE_ALIGN - 1))
@@ -387,7 +420,7 @@ static inline CacheShard *hash_to_shard(Cache *cache, ass_hashcode hash,
                                         unsigned *bucket)
 {
     *bucket = (unsigned) (hash & (CACHE_SHARD_BUCKETS - 1));
-    size_t idx = (size_t) (hash >> 40) & (N_CACHE_SHARDS - 1);
+    size_t idx = (size_t) (hash >> 40) & cache->shard_mask;
     return &cache->shards[idx];
 }
 
@@ -399,6 +432,7 @@ Cache *ass_cache_create(const CacheDesc *desc)
     if (!cache)
         return NULL;
     cache->desc = desc;
+    cache->shard_mask = k1_shardprobe_enabled() ? 0 : (N_CACHE_SHARDS - 1);
 
     size_t i;
     for (i = 0; i < N_CACHE_SHARDS; i++) {
@@ -488,9 +522,11 @@ void *ass_cache_get(Cache *cache, void *key, void *priv)
         promote_item(shard, item);
         ass_mutex_unlock(&shard->mutex);
         desc->key_move_func(NULL, key);
+        STAT_BUMP(cache, st_hits);
         return (char *) item + CACHE_ITEM_SIZE;
     }
     ass_mutex_unlock(&shard->mutex);
+    STAT_BUMP(cache, st_misses);
 
     // Miss: build the item with the (potentially expensive, recursive)
     // construct_func OUTSIDE the lock, then publish it.
@@ -578,7 +614,7 @@ void ass_cache_dec_ref(void *value)
 }
 
 // Evict least-recently-used items from one shard. Caller-serialized (no lock).
-static void cut_shard(CacheShard *shard, size_t max_size)
+static void cut_shard(Cache *cache, CacheShard *shard, size_t max_size)
 {
     if (shard->cache_size <= max_size)
         return;
@@ -600,6 +636,7 @@ static void cut_shard(CacheShard *shard, size_t max_size)
         *item->prev = item->next;
 
         shard->cache_size -= item->size + (item->size == 1 ? 0 : CACHE_ITEM_SIZE);
+        STAT_BUMP(cache, st_evictions);
         destroy_item(item->desc, item);
     } while (shard->cache_size > max_size);
     if (shard->queue_first)
@@ -610,9 +647,24 @@ static void cut_shard(CacheShard *shard, size_t max_size)
 
 void ass_cache_cut(Cache *cache, size_t max_size)
 {
-    size_t shard_max = max_size / N_CACHE_SHARDS;
-    for (size_t i = 0; i < N_CACHE_SHARDS; i++)
-        cut_shard(&cache->shards[i], shard_max);
+    size_t n_live = cache->shard_mask + 1;
+    size_t shard_max = max_size / n_live;
+    for (size_t i = 0; i < n_live; i++)
+        cut_shard(cache, &cache->shards[i], shard_max);
+}
+
+void ass_cache_stats(Cache *cache, unsigned long long *hits,
+                     unsigned long long *misses, unsigned long long *evictions,
+                     size_t *size, size_t *n_shards)
+{
+    *hits = ass_atomic_load_size(&cache->st_hits);
+    *misses = ass_atomic_load_size(&cache->st_misses);
+    *evictions = ass_atomic_load_size(&cache->st_evictions);
+    size_t tot = 0;
+    for (size_t i = 0; i <= cache->shard_mask; i++)
+        tot += cache->shards[i].cache_size;
+    *size = tot;
+    *n_shards = cache->shard_mask + 1;
 }
 
 void ass_cache_empty(Cache *cache)
