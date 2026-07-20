@@ -4262,6 +4262,24 @@ ASS_Image *ass_render_frame(ASS_Renderer *priv, ASS_Track *track,
     if (track->parser_priv->prune_delay >= 0)
         ass_prune_events(track, now - track->parser_priv->prune_delay);
 
+    // WP-K7 SCRATCH INSTRUMENTATION -- not for merge.
+    {
+        static int k7_on = -1;
+        if (k7_on < 0)
+            k7_on = getenv("ASS_CACHE_STATS_K7") ? 1 : 0;
+        if (k7_on) {
+            void ass_cache_stats_k7(Cache *, size_t *, size_t *);
+            size_t bs=0, bn=0, os=0, on=0, cs=0, cn=0;
+            ass_cache_stats_k7(priv->cache.bitmap_cache, &bs, &bn);
+            ass_cache_stats_k7(priv->cache.outline_cache, &os, &on);
+            ass_cache_stats_k7(priv->cache.composite_cache, &cs, &cn);
+            fprintf(stderr, "K7CACHE bitmap_bytes=%zu bitmap_items=%zu "
+                    "outline_bytes=%zu outline_items=%zu "
+                    "composite_bytes=%zu composite_items=%zu\n",
+                    bs, bn, os, on, cs, cn);
+        }
+    }
+
     return priv->images_root;
 }
 

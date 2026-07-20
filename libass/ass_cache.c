@@ -680,3 +680,22 @@ Cache *ass_composite_cache_create(void)
 {
     return ass_cache_create(&composite_cache_desc);
 }
+
+
+// WP-K7 SCRATCH INSTRUMENTATION -- not for merge.
+void ass_cache_stats_k7(Cache *cache, size_t *size, size_t *count);
+void ass_cache_stats_k7(Cache *cache, size_t *size, size_t *count)
+{
+    size_t sz = 0, n = 0;
+    for (size_t i = 0; i < N_CACHE_SHARDS; i++) {
+        CacheShard *sh = &cache->shards[i];
+        ass_mutex_lock(&sh->mutex);
+        sz += sh->cache_size;
+        for (unsigned b = 0; b < CACHE_SHARD_BUCKETS; b++)
+            for (CacheItem *it = sh->map[b]; it; it = it->next)
+                n++;
+        ass_mutex_unlock(&sh->mutex);
+    }
+    *size = sz;
+    *count = n;
+}
