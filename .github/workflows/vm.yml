@@ -67,7 +67,7 @@ jobs:
 
           - name: 'ART(omnios64-qemu, illumos/OmniOS, amd64)'
             os_image: omnios
-            os_version: r151056
+            os_version: r151058
             # errors by default, but illumos has spec-incompliant iconv (const vs restrict)
             CC: 'gcc -Wno-error=incompatible-pointer-types'
             confenv: 'PKG_CONFIG_PATH=/opt/ooce/lib/64/pkgconfig'
@@ -77,6 +77,11 @@ jobs:
       ASAN_OPTIONS: ${{ matrix.ASAN_OPTIONS }}
       AUTOCONF_VERSION: ${{ matrix.AUTOCONF_VERSION }}
       AUTOMAKE_VERSION: ${{ matrix.AUTOMAKE_VERSION }}
+
+    defaults:
+      run:
+        # Avoid syncing after each step, we only need an initial sync for repos
+        shell: cpa.sh {0} --sync-files none
 
     steps:
       # Available core count changes on runner type and over time, but GHA
@@ -109,101 +114,76 @@ jobs:
           ref: ${{ github.event.inputs.test_ref }}
           path: './libass-tests'
 
-      - name: Install Packages
-        uses: cross-platform-actions/action@v1.0.0
+      - name: Start VM
+        uses: cross-platform-actions/action@v1.4.0
         with:
           operating_system: ${{ matrix.os_image }}
           version: ${{ matrix.os_version }}
-          # env vars not really needed here, but must match across all steps
           environment_variables: ASAN_OPTIONS AUTOCONF_VERSION AUTOMAKE_VERSION
-          shutdown_vm: false
-          sync_files: false
-          run: |
-            # Install Packages
-            case "${{ matrix.os_image }}" in
-              netbsd)
-                # We'll use the base system's version of gcc
-                sudo pkgin -y install \
-                    mozilla-rootcerts-openssl git nasm \
-                    autoconf automake libtool-base pkg-config \
-                    freetype fribidi harfbuzz fontconfig png
-                ;;
-              freebsd)
-                # Using system compiler
-                sudo pkg -o ASSUME_ALWAYS_YES=yes install \
-                  git nasm ca_root_nss \
-                  autoconf automake libtool pkgconf \
-                  freetype2 fribidi harfbuzz fontconfig png
-                ;;
-              openbsd)
-                # while OpenBSD natively uses doas,
-                # cross-platform-action only preconfigured sudo.
-                # Using system-provided: compiler, fontconfig, freetype, pkgconf
-                sudo pkg_add \
-                  git nasm libtool \
-                  autoconf-"$AUTOCONF_VERSION"p0 \
-                  automake-"$AUTOMAKE_VERSION" \
-                  fribidi harfbuzz libunibreak png
-                ;;
-              haiku)
-                pkgman install -y \
-                  git nasm gcc make pkgconfig \
-                  libtool autoconf automake \
-                  freetype_devel fribidi_devel harfbuzz_devel \
-                  fontconfig_devel libunibreak_devel libpng16_devel
-                ;;
-              omnios)
-                # "ooce" extra packages are not in regular search paths.
-                # Activate via /opt/ooce/lib/64/pkgconfig etc.
-                # Harfbuzz and fribidi are bundled with pango (no standalone package).
-                sudo pkg install --deny-new-be --no-backup-be \
-                  pkg:/developer/gcc14 \
-                  pkg:/developer/nasm \
-                  pkg:/developer/build/make \
-                  pkg:/developer/pkg-config \
-                  pkg:/developer/build/autoconf \
-                  pkg:/developer/build/automake \
-                  pkg:/developer/build/libtool \
-                  pkg:/ooce/library/fontconfig \
-                  pkg:/ooce/library/pango \
-                  pkg:/ooce/library/libpng
-                ;;
-            esac
+          sync_files: runner-to-vm
+
+      - name: Install Packages
+        run: |
+          # Install Packages
+          case "${{ matrix.os_image }}" in
+            netbsd)
+              # We'll use the base system's version of gcc
+              sudo pkgin -y install \
+                  mozilla-rootcerts-openssl git nasm \
+                  autoconf automake libtool-base pkg-config \
+                  freetype fribidi harfbuzz fontconfig png
+              ;;
+            freebsd)
+              # Using system compiler
+              sudo pkg -o ASSUME_ALWAYS_YES=yes install \
+                git nasm ca_root_nss \
+                autoconf automake libtool pkgconf \
+                freetype2 fribidi harfbuzz fontconfig png
+              ;;
+            openbsd)
+              # while OpenBSD natively uses doas,
+              # cross-platform-action only preconfigured sudo.
+              # Using system-provided: compiler, fontconfig, freetype, pkgconf
+              sudo pkg_add \
+                git nasm libtool \
+                autoconf-"$AUTOCONF_VERSION"p0 \
+                automake-"$AUTOMAKE_VERSION" \
+                fribidi harfbuzz libunibreak png
+              ;;
+            haiku)
+              pkgman install -y \
+                git nasm gcc make pkgconfig \
+                libtool autoconf automake \
+                freetype_devel fribidi_devel harfbuzz_devel \
+                fontconfig_devel libunibreak_devel libpng16_devel
+              ;;
+            omnios)
+              # "ooce" extra packages are not in regular search paths.
+              # Activate via /opt/ooce/lib/64/pkgconfig etc.
+              # Harfbuzz and fribidi are bundled with pango (no standalone package).
+              sudo pkg install --deny-new-be --no-backup-be \
+                pkg:/developer/gcc14 \
+                pkg:/developer/nasm \
+                pkg:/developer/build/make \
+                pkg:/developer/pkg-config \
+                pkg:/developer/build/autoconf \
+                pkg:/developer/build/automake \
+                pkg:/developer/build/libtool \
+                pkg:/ooce/library/fontconfig \
+                pkg:/ooce/library/pango \
+                pkg:/ooce/library/libpng
+              ;;
+          esac
 
       - name: Build libass
-        uses: cross-platform-actions/action@v1.0.0
-        with:
-          operating_system: ${{ matrix.os_image }}
-          version: ${{ matrix.os_version }}
-          environment_variables: ASAN_OPTIONS AUTOCONF_VERSION AUTOMAKE_VERSION
-          shutdown_vm: false
-          sync_files: true
-          run: |
-            ./autogen.sh
-            env ${{ matrix.confenv }} \
-              ./configure CC="${{ matrix.CC }}" ${{ matrix.confflags }} --enable-fuzz --enable-compare
-            make -j '${{ steps.cpus.outputs.count }}'
+        run: |
+          ./autogen.sh
+          env ${{ matrix.confenv }} \
+            ./configure CC="${{ matrix.CC }}" ${{ matrix.confflags }} --enable-fuzz --enable-compare
+          make -j '${{ steps.cpus.outputs.count }}'
 
       - name: Run Tests
-        uses: cross-platform-actions/action@v1.0.0
-        with:
-          operating_system: ${{ matrix.os_image }}
-          version: ${{ matrix.os_version }}
-          environment_variables: ASAN_OPTIONS AUTOCONF_VERSION AUTOMAKE_VERSION
-          shutdown_vm: false
-          sync_files: true
-          run: |
-            ART_REG_SKIP="${{ matrix.ART_REG_SKIP }}" \
-            make ART_SAMPLES="./libass-tests" check \
-            || (cat ./test-suite.log; exit 1)
-
-      - name: Shutdown VM
-        if: always()
-        uses: cross-platform-actions/action@v1.0.0
-        with:
-          operating_system: ${{ matrix.os_image }}
-          version: ${{ matrix.os_version }}
-          environment_variables: ASAN_OPTIONS AUTOCONF_VERSION AUTOMAKE_VERSION
-          shutdown_vm: true
-          sync_files: false
-          run: echo 'Byebye ^^)/"'
+        run: |
+          ART_REG_SKIP="${{ matrix.ART_REG_SKIP }}" \
+          make ART_SAMPLES="./libass-tests" check \
+          || (cat ./test-suite.log; exit 1)

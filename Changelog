@@ -1,6 +1,6 @@
 libass (0.17.5)
- * Fix limited OOB read and write in wrap_lines_measure (GHSA-pjjp-65r7-ppgm; CVE pending)
- * Fix OOB bit clears for negative Matroska ReadOrder fields (GHSA-5gf7-wjfm-vmvm; CVE pending)
+ * Fix limited OOB read and write in wrap_lines_measure (GHSA-pjjp-65r7-ppgm; CVE-2026-61627)
+ * Fix OOB bit clears for negative Matroska ReadOrder fields (GHSA-5gf7-wjfm-vmvm; CVE-2026-61626)
  * Fix \fay with glyph clusters
  * Fix small alpha changes not always splitting runs when combined with fade
  * Fix compilation with MSVC-mode clang
